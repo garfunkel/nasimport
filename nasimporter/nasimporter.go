@@ -3,10 +3,10 @@
 package nasimporter
 
 import (
-	"NAS/nasimport/constants"
+	"github.com/garfunkel/nasimport/constants"
 	"fmt"
 	"os"
-	"NAS/nasimport/mapregexp"
+	"github.com/garfunkel/nasimport/mapregexp"
 	"regexp"
 	"path/filepath"
 	"errors"

@@ -2,7 +2,7 @@ package main
 
 import (
 	"flag"
-	"NAS/nasimport/nasimporter"
+	"github.com/garfunkel/nasimport/nasimporter"
 )
 
 func main() {
