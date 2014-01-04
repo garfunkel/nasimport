@@ -3,14 +3,18 @@
 package nasimporter
 
 import (
-	"github.com/garfunkel/nasimport/constants"
-	"fmt"
-	"os"
-	"github.com/garfunkel/nasimport/mapregexp"
 	"regexp"
 	"path/filepath"
 	"errors"
 	"sort"
+	"fmt"
+	"os"
+	"net/http"
+	"strings"
+	"github.com/garfunkel/nasimport/constants"
+	"github.com/garfunkel/nasimport/mapregexp"
+	"github.com/krusty64/tvdb"
+	"github.com/StalkR/imdb"
 )
 
 const (
@@ -20,13 +24,21 @@ const (
 )
 
 type NasImporter struct {
-	tvShowRegex mapregexp.MapRegexp
+	tvShowRegex *mapregexp.MapRegexp
+	singleDocumentaryRegex *mapregexp.MapRegexp
+	multiDocumentaryRegex *mapregexp.MapRegexp
+	seasonDocumentaryRegex *mapregexp.MapRegexp
+	yearDocumentaryRegex *mapregexp.MapRegexp
+	movieWithYearRegex *mapregexp.MapRegexp
+	movieWithoutYearRegex *mapregexp.MapRegexp
 	existingTVShowDirs map[string][]string
 	existingDocumentaryFiles []string
 	existingDocumentaryDirs map[string][]string
 	existingMovieFiles []string
 	existingMovieDirs map[string][]string
-	wordRegex regexp.Regexp
+	wordRegex *regexp.Regexp
+	tvdbClient *tvdb.TVDB
+	imdbClient http.Client
 }
 
 type ScoreItem struct {
@@ -52,8 +64,18 @@ func (scoreItems ScoreItems) Swap(i, j int) {
 func NewNasImporter() NasImporter {
 	importer := NasImporter{}
 
-	importer.tvShowRegex = *mapregexp.MustCompile("(?P<name>.+?)[sS](?P<series>\\d+)[eE](?P<episode>\\d+)(?P<other>.*)\\.(?P<ext>.*?)$")
-	importer.wordRegex = *regexp.MustCompile("[^\\.\\-_\\+\\s]+")
+	importer.tvShowRegex = mapregexp.MustCompile(`(?P<name>.+?)[sS](?P<series>\d+)[eE](?P<episode>\d+)(?P<other>.*)\.(?P<ext>[^\.]*)$`)
+	importer.singleDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)\.(?P<ext>[^\.]*)$`)
+	importer.multiDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)([pP][tT]|part|Part|[eE]|episode|Episode).*?(?P<episode>\d+)\.(?P<ext>[^\.]*)$`)
+	importer.yearDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)((year|Year).*)?(?P<year>\d{4}).*?([eE]|episode|Episode|part|Part|pt|PT|Pt).*?(?P<episode>\d+)(?P<other>.*)\.(?P<ext>[^\.]*)$`)
+	importer.seasonDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)[sS](?P<series>\d+)[eE](?P<episode>\d+)(?P<other>.*)\.(?P<ext>[^\.]*)$`)
+
+	// I didn't know this but an optional group after a variable length group leads to unexpected results.
+	importer.movieWithYearRegex = mapregexp.MustCompile(`(?P<name>.+?)(?P<year>\d{4})(?P<other>.*?)\.(?P<ext>[^\.]*)$`)
+	importer.movieWithoutYearRegex = mapregexp.MustCompile(`(?P<name>.+?)\.(?P<ext>[^\.]*)$`)
+
+	importer.wordRegex = regexp.MustCompile("[^\\.\\-_\\+\\s]+")
+	importer.tvdbClient = tvdb.Open()
 
 	importer.ReadExistingMedia()
 
@@ -101,8 +123,8 @@ func (importer *NasImporter) getFilesDirs(path string) (files []string, dirs map
 	return
 }
 
-func (importer *NasImporter) detectTVShow(path string) (order ScoreItems, err error) {
-	tvShowFields := importer.tvShowRegex.FindStringSubmatchMap(path)
+func (importer *NasImporter) detectTVShow(path string) (order ScoreItems, tvShowFields map[string]string, tvShowTVDBResults *tvdb.GetDetailSeriesData, err error) {
+	tvShowFields = importer.tvShowRegex.FindStringSubmatchMap(path)
 
 	if tvShowFields == nil {
 		err = errors.New("Not a TV show")
@@ -111,19 +133,82 @@ func (importer *NasImporter) detectTVShow(path string) (order ScoreItems, err er
 	}
 
 	// If we get here, we may have a new/existing TV show, but it could also still be a doco.
-
 	// Split name of tv show into words, and find the most probable results.
 	tvShowWords := importer.wordRegex.FindAllString(tvShowFields["name"], -1)
 	order = importer.getDirMatchOrder(importer.existingTVShowDirs, tvShowWords)
+	probableTitle := strings.Join(tvShowWords, " ")
+
+	// Search TVDB for results.
+	rawSeries, _ := importer.tvdbClient.GetSeries(probableTitle, "")
+	tvShowTVDBResults, _ = tvdb.ParseDetailSeriesData(rawSeries)
 
 	return
 }
 
-func (importer *NasImporter) detectDocumentary(path string) (order ScoreItems, err error) {
+func (importer *NasImporter) detectDocumentary(path string) (order ScoreItems, documentaryFields map[string]string, documentaryTVDBResults *tvdb.GetDetailSeriesData, err error) {
+	documentaryRegexes := [...]*mapregexp.MapRegexp{
+		importer.seasonDocumentaryRegex,
+		importer.yearDocumentaryRegex,
+		importer.multiDocumentaryRegex,
+		importer.singleDocumentaryRegex,
+	}
+
+	// Try the different documentaryRegexes in order of complexity as a singleDocumentaryRegex will almost always return results.
+	for _, documentaryRegex := range documentaryRegexes {
+		documentaryFields = documentaryRegex.FindStringSubmatchMap(path)
+
+		if documentaryFields == nil {
+			continue
+		}
+
+		documentaryWords := importer.wordRegex.FindAllString(documentaryFields["Name"], -1)
+		order = importer.getDirMatchOrder(importer.existingDocumentaryDirs, documentaryWords)
+		probableTitle := strings.Join(documentaryWords, " ")
+
+		// Search TVDB for results.
+		rawSeries, _ := importer.tvdbClient.GetSeries(probableTitle, "")
+		documentaryTVDBResults, _ = tvdb.ParseDetailSeriesData(rawSeries)
+
+		//episodeData, _ := importer.tvDB.GetEpisodeBySeasonEp(series.Series[0].Id, 1, 1, "en")
+		//episode, _ := tvdb.ParseSingleEpisode(episodeData)
+
+		return
+	}
+
+	err = errors.New("Not a documentary")
+
 	return
 }
 
-func (importer *NasImporter) detectMovie(path string) (order ScoreItems, err error) {
+func (importer *NasImporter) detectMovie(path string) (order ScoreItems, movieFields map[string]string, movieIMDBResults []imdb.Title, err error) {
+	movieFields = importer.movieWithYearRegex.FindStringSubmatchMap(path)
+
+	if movieFields == nil {
+		movieFields = importer.movieWithoutYearRegex.FindStringSubmatchMap(path)
+	}
+
+	if movieFields == nil {
+		err = errors.New("Not a movie")
+
+		return
+	}
+
+	movieWords := importer.wordRegex.FindAllString(movieFields["name"], -1)
+	order = importer.getDirMatchOrder(importer.existingMovieDirs, movieWords)
+	probableTitle := strings.Join(movieWords, " ")
+
+	// If we have a year, use it to aid our search.z
+	year, ok := movieFields["year"]
+
+	if ok {
+		probableTitle += " " + year
+	}
+
+	println(probableTitle)
+
+	// Search IMDB for results.
+	movieIMDBResults, err = imdb.SearchTitle(&importer.imdbClient, probableTitle)
+
 	return
 }
 
@@ -152,15 +237,27 @@ func (importer *NasImporter) getDirMatchOrder(dirMap map[string][]string, words 
 }
 
 func (importer *NasImporter) Import(path string) (err error) {
+	file := filepath.Base(path)
+
 	fmt.Printf("Importing %s\n", path)
 	fmt.Printf("Attempting to detect if this is a TV show...\n")
 
-	file := filepath.Base(path)
-	tvShowOrder, err := importer.detectTVShow(file)
-	documentaryOrder, err := importer.detectDocumentary(file)
-	movieOrder, err := importer.detectMovie(file)
+	tvShowOrder, tvShowFields, tvShowTVDBResults, err := importer.detectTVShow(file)
+
+	fmt.Printf("Attempting to detect if this is a documentary...\n")
+
+	documentaryOrder, documentaryFields, documentaryTVDBResults, err := importer.detectDocumentary(file)
+
+	fmt.Printf("Attempting to detect if this is a movie...\n")
+
+	movieOrder, movieFields, movieIMDBResults, err := importer.detectMovie(file)
+
+	// Logic to decide best type of media.
+
 
 	println(tvShowOrder, documentaryOrder, movieOrder)
+	fmt.Printf("TV FIELDS: %#v\nDOC FIELDS: %#v\nMOVIE FIELDS: %#v\n", tvShowFields, documentaryFields, movieFields)
+	println(&tvShowTVDBResults, &documentaryTVDBResults, &movieIMDBResults)
 
 	if err != nil {
 		fmt.Printf("%s\n", err)

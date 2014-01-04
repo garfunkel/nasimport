@@ -1,5 +1,5 @@
 package constants
 
 const (
-	MediaRoot = "/home/simon/dataFamily/"
+	MediaRoot = "/home/simon/dataFRED/"
 )
