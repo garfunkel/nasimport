@@ -11,10 +11,12 @@ import (
 	"os"
 	"net/http"
 	"strings"
+	"strconv"
 	"github.com/garfunkel/nasimport/constants"
 	"github.com/garfunkel/nasimport/mapregexp"
 	"github.com/krusty64/tvdb"
 	"github.com/StalkR/imdb"
+	"github.com/arbovm/levenshtein"
 )
 
 const (
@@ -44,7 +46,7 @@ type NasImporter struct {
 type ScoreItem struct {
 	value string
 	words []string
-	score uint
+	score int
 }
 
 type ScoreItems []ScoreItem
@@ -54,7 +56,7 @@ func (scoreItems ScoreItems) Len() int {
 }
 
 func (scoreItems ScoreItems) Less(i, j int) bool {
-	return scoreItems[i].score > scoreItems[j].score
+	return scoreItems[i].score < scoreItems[j].score
 }
 
 func (scoreItems ScoreItems) Swap(i, j int) {
@@ -64,7 +66,7 @@ func (scoreItems ScoreItems) Swap(i, j int) {
 func NewNasImporter() NasImporter {
 	importer := NasImporter{}
 
-	importer.tvShowRegex = mapregexp.MustCompile(`(?P<name>.+?)[sS](?P<series>\d+)[eE](?P<episode>\d+)(?P<other>.*)\.(?P<ext>[^\.]*)$`)
+	importer.tvShowRegex = mapregexp.MustCompile(`(?P<name>.+?)[sS]?(?P<series>\d+)[eE]?(?P<episode>\d{2,})(?P<other>.*)\.(?P<ext>[^\.]*)$`)
 	importer.singleDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)\.(?P<ext>[^\.]*)$`)
 	importer.multiDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)([pP][tT]|part|Part|[eE]|episode|Episode).*?(?P<episode>\d+)\.(?P<ext>[^\.]*)$`)
 	importer.yearDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)((year|Year).*)?(?P<year>\d{4}).*?([eE]|episode|Episode|part|Part|pt|PT|Pt).*?(?P<episode>\d+)(?P<other>.*)\.(?P<ext>[^\.]*)$`)
@@ -161,8 +163,9 @@ func (importer *NasImporter) detectDocumentary(path string) (order ScoreItems, d
 			continue
 		}
 
-		documentaryWords := importer.wordRegex.FindAllString(documentaryFields["Name"], -1)
+		documentaryWords := importer.wordRegex.FindAllString(documentaryFields["name"], -1)
 		order = importer.getDirMatchOrder(importer.existingDocumentaryDirs, documentaryWords)
+		fmt.Printf("%#v\n\n\n", order)
 		probableTitle := strings.Join(documentaryWords, " ")
 
 		// Search TVDB for results.
@@ -204,8 +207,6 @@ func (importer *NasImporter) detectMovie(path string) (order ScoreItems, movieFi
 		probableTitle += " " + year
 	}
 
-	println(probableTitle)
-
 	// Search IMDB for results.
 	movieIMDBResults, err = imdb.SearchTitle(&importer.imdbClient, probableTitle)
 
@@ -219,13 +220,18 @@ func (importer *NasImporter) getDirMatchOrder(dirMap map[string][]string, words 
 	for dir, dirWords := range dirMap {
 		scoreItem := ScoreItem{value: dir, words: dirWords}
 
-		for _, word := range words {
+		joinedDirWords := strings.Join(dirWords, " ")
+		joinedWords := strings.Join(words, " ")
+
+		scoreItem.score = levenshtein.Distance(joinedWords, joinedDirWords)
+
+		/*for _, word := range words {
 			for _, dirWord := range dirWords {
-				if word == dirWord {
+				if strings.ToLower(word) == strings.ToLower(dirWord) {
 					scoreItem.score++
 				}
 			}
-		}
+		}*/
 
 		order[orderIndex] = scoreItem
 		orderIndex++
@@ -234,6 +240,24 @@ func (importer *NasImporter) getDirMatchOrder(dirMap map[string][]string, words 
 	sort.Sort(order)
 
 	return
+}
+
+func (importer *NasImporter) importMKV(path, outPath string) {
+
+}
+
+func (importer *NasImporter) processTVShow(path string, fileFields map[string]string, metadata *tvdb.GetDetailSeriesData) {
+	seasonNum, _ := strconv.Atoi(fileFields["series"])
+	episodeNum, _ := strconv.Atoi(fileFields["episode"])
+	episodeData, _ := importer.tvdbClient.GetEpisodeBySeasonEp(metadata.Series[0].Id, seasonNum, episodeNum, "en")
+	episode, _ := tvdb.ParseSingleEpisode(episodeData)
+	outPath := fmt.Sprintf("%s/%s/Season %02d/%s S%02dE%02d - %s.mkv", TVRoot, metadata.Series[0].SeriesName, seasonNum, metadata.Series[0].SeriesName, seasonNum, episodeNum, episode.Episode.EpisodeName)
+
+	importer.importMKV(path, outPath)
+}
+
+func (importer *NasImporter) processDocumentary(path string, fileFields map[string]string, metadata *tvdb.GetDetailSeriesData) {
+	println("here");
 }
 
 func (importer *NasImporter) Import(path string) (err error) {
@@ -258,6 +282,16 @@ func (importer *NasImporter) Import(path string) (err error) {
 	println(tvShowOrder, documentaryOrder, movieOrder)
 	fmt.Printf("TV FIELDS: %#v\nDOC FIELDS: %#v\nMOVIE FIELDS: %#v\n", tvShowFields, documentaryFields, movieFields)
 	println(&tvShowTVDBResults, &documentaryTVDBResults, &movieIMDBResults)
+
+	fmt.Printf("%#v %#v\n", tvShowOrder[0], documentaryOrder[0])
+
+	if len(tvShowOrder) >= len(documentaryOrder) && len(tvShowOrder) >= len(movieOrder) {
+		importer.processTVShow(path, tvShowFields, tvShowTVDBResults)
+	} else if len(documentaryOrder) >= len(tvShowOrder) && len(documentaryOrder) >= len(movieOrder) {
+		importer.processDocumentary(path, documentaryFields, documentaryTVDBResults)
+	} else {
+
+	}
 
 	if err != nil {
 		fmt.Printf("%s\n", err)
