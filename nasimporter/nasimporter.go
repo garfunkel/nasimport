@@ -9,6 +9,7 @@ import (
 	"sort"
 	"fmt"
 	"os"
+	"math"
 	"net/http"
 	"strings"
 	"strconv"
@@ -25,6 +26,14 @@ const (
 	MovieRoot = constants.MediaRoot + "Movies"
 )
 
+type MediaType int
+
+const (
+	TV MediaType = iota
+	Documentary
+	Movie
+)
+
 type NasImporter struct {
 	tvShowRegex *mapregexp.MapRegexp
 	singleDocumentaryRegex *mapregexp.MapRegexp
@@ -38,6 +47,7 @@ type NasImporter struct {
 	existingDocumentaryDirs map[string][]string
 	existingMovieFiles []string
 	existingMovieDirs map[string][]string
+	numVisibleResults int
 	wordRegex *regexp.Regexp
 	tvdbClient *tvdb.TVDB
 	imdbClient http.Client
@@ -47,6 +57,12 @@ type ScoreItem struct {
 	value string
 	words []string
 	score int
+}
+
+type ImportChoice struct {
+	mediaType MediaType
+	path string
+	data *interface{}
 }
 
 type ScoreItems []ScoreItem
@@ -66,11 +82,13 @@ func (scoreItems ScoreItems) Swap(i, j int) {
 func NewNasImporter() NasImporter {
 	importer := NasImporter{}
 
-	importer.tvShowRegex = mapregexp.MustCompile(`(?P<name>.+?)[sS]?(?P<series>\d+)[eE]?(?P<episode>\d{2,})(?P<other>.*)\.(?P<ext>[^\.]*)$`)
+	importer.numVisibleResults = 5
+
+	importer.tvShowRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_)?[sS]?(?P<series>\d+)[eE]?(?P<episode>\d{2,})(\.|-|_)?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
 	importer.singleDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)\.(?P<ext>[^\.]*)$`)
-	importer.multiDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)([pP][tT]|part|Part|[eE]|episode|Episode).*?(?P<episode>\d+)\.(?P<ext>[^\.]*)$`)
-	importer.yearDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)((year|Year).*)?(?P<year>\d{4}).*?([eE]|episode|Episode|part|Part|pt|PT|Pt).*?(?P<episode>\d+)(?P<other>.*)\.(?P<ext>[^\.]*)$`)
-	importer.seasonDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)[sS](?P<series>\d+)[eE](?P<episode>\d+)(?P<other>.*)\.(?P<ext>[^\.]*)$`)
+	importer.multiDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_)?([pP][tT]|part|Part|[eE]|episode|Episode).*?(?P<episode>\d+)\.(?P<ext>[^\.]*)$`)
+	importer.yearDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_)?((year|Year).*)?(?P<year>\d{4}).*?([eE]|episode|Episode|part|Part|pt|PT|Pt).*?(?P<episode>\d+)(\.|-|_)?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
+	importer.seasonDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_)?[sS](?P<series>\d+)[eE](?P<episode>\d+)(\.|-|_)?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
 
 	// I didn't know this but an optional group after a variable length group leads to unexpected results.
 	importer.movieWithYearRegex = mapregexp.MustCompile(`(?P<name>.+?)(?P<year>\d{4})(?P<other>.*?)\.(?P<ext>[^\.]*)$`)
@@ -165,15 +183,11 @@ func (importer *NasImporter) detectDocumentary(path string) (order ScoreItems, d
 
 		documentaryWords := importer.wordRegex.FindAllString(documentaryFields["name"], -1)
 		order = importer.getDirMatchOrder(importer.existingDocumentaryDirs, documentaryWords)
-		fmt.Printf("%#v\n\n\n", order)
 		probableTitle := strings.Join(documentaryWords, " ")
 
 		// Search TVDB for results.
 		rawSeries, _ := importer.tvdbClient.GetSeries(probableTitle, "")
 		documentaryTVDBResults, _ = tvdb.ParseDetailSeriesData(rawSeries)
-
-		//episodeData, _ := importer.tvDB.GetEpisodeBySeasonEp(series.Series[0].Id, 1, 1, "en")
-		//episode, _ := tvdb.ParseSingleEpisode(episodeData)
 
 		return
 	}
@@ -208,7 +222,8 @@ func (importer *NasImporter) detectMovie(path string) (order ScoreItems, movieFi
 	}
 
 	// Search IMDB for results.
-	movieIMDBResults, err = imdb.SearchTitle(&importer.imdbClient, probableTitle)
+	// Ignore error, it seems that if no results are found we get an error.
+	movieIMDBResults, _ = imdb.SearchTitle(&importer.imdbClient, probableTitle)
 
 	return
 }
@@ -219,20 +234,9 @@ func (importer *NasImporter) getDirMatchOrder(dirMap map[string][]string, words 
 
 	for dir, dirWords := range dirMap {
 		scoreItem := ScoreItem{value: dir, words: dirWords}
-
 		joinedDirWords := strings.Join(dirWords, " ")
 		joinedWords := strings.Join(words, " ")
-
 		scoreItem.score = levenshtein.Distance(joinedWords, joinedDirWords)
-
-		/*for _, word := range words {
-			for _, dirWord := range dirWords {
-				if strings.ToLower(word) == strings.ToLower(dirWord) {
-					scoreItem.score++
-				}
-			}
-		}*/
-
 		order[orderIndex] = scoreItem
 		orderIndex++
 	}
@@ -277,24 +281,70 @@ func (importer *NasImporter) Import(path string) (err error) {
 	movieOrder, movieFields, movieIMDBResults, err := importer.detectMovie(file)
 
 	// Logic to decide best type of media.
-
-
-	println(tvShowOrder, documentaryOrder, movieOrder)
 	fmt.Printf("TV FIELDS: %#v\nDOC FIELDS: %#v\nMOVIE FIELDS: %#v\n", tvShowFields, documentaryFields, movieFields)
-	println(&tvShowTVDBResults, &documentaryTVDBResults, &movieIMDBResults)
 
-	fmt.Printf("%#v %#v\n", tvShowOrder[0], documentaryOrder[0])
+	matchId := 1
 
-	if len(tvShowOrder) >= len(documentaryOrder) && len(tvShowOrder) >= len(movieOrder) {
-		importer.processTVShow(path, tvShowFields, tvShowTVDBResults)
-	} else if len(documentaryOrder) >= len(tvShowOrder) && len(documentaryOrder) >= len(movieOrder) {
-		importer.processDocumentary(path, documentaryFields, documentaryTVDBResults)
-	} else {
+	fmt.Printf("Most likely TV show matches:\n")
 
+	//choices := make(map[int]ImportChoice)
+
+	for index := 0; index < int(math.Min(float64(importer.numVisibleResults), float64(len(tvShowOrder)))); index++ {
+		fmt.Printf("\t%v | %v\t%v\n", matchId, tvShowOrder[index].score, filepath.Base(tvShowOrder[index].value))
+
+		matchId++
 	}
 
+	fmt.Printf("\nMost likely TV show matches (TVDB):\n")
+
+	for index := 0; index < int(math.Min(float64(importer.numVisibleResults), float64(len(tvShowTVDBResults.Series)))); index++ {
+		fmt.Printf("\t%v | %v\t%v\n", matchId, tvShowTVDBResults.Series[index].Id, tvShowTVDBResults.Series[index].SeriesName)
+
+		matchId++
+	}
+
+	fmt.Printf("\nMost likely documentary matches:\n")
+
+	for index := 0; index < int(math.Min(float64(importer.numVisibleResults), float64(len(tvShowOrder)))); index++ {
+		fmt.Printf("\t%v | %v\t%v\n", matchId, documentaryOrder[index].score, filepath.Base(documentaryOrder[index].value))
+
+		matchId++
+	}
+
+	fmt.Printf("\nMost likely documentary matches (TVDB):\n")
+
+	for index := 0; index < int(math.Min(float64(importer.numVisibleResults), float64(len(documentaryTVDBResults.Series)))); index++ {
+		fmt.Printf("\t%v | %v\t%v\n", matchId, documentaryTVDBResults.Series[index].Id, documentaryTVDBResults.Series[index].SeriesName)
+
+		matchId++
+	}
+
+	fmt.Printf("\nMost likely movie matches:\n")
+
+	for index := 0; index < int(math.Min(float64(importer.numVisibleResults), float64(len(movieOrder)))); index++ {
+		fmt.Printf("\t%v | %v\t%v\n", matchId, movieOrder[index].score, movieOrder[index].value)
+
+		matchId++
+	}
+
+	fmt.Printf("\nMost likely movie matches (IMDB):\n")
+
+	for index := 0; index < int(math.Min(float64(importer.numVisibleResults), float64(len(movieIMDBResults)))); index++ {
+		fmt.Printf("\t%v | %v\t%v (%v)\n", matchId, movieIMDBResults[index].ID, movieIMDBResults[index].Name, movieIMDBResults[index].Year)
+
+		matchId++
+	}
+
+	fmt.Printf("Enter ID of result or press enter to override: ")
+
+	numChars, err := fmt.Scanf("%d", &matchId)
+
 	if err != nil {
-		fmt.Printf("%s\n", err)
+		if numChars == 0 {
+
+		} else {
+			
+		}
 	}
 
 	return
