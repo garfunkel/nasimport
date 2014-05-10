@@ -9,12 +9,13 @@ import (
 	"sort"
 	"fmt"
 	"os"
+	//"log"
 	"math"
 	"net/http"
 	"strings"
 	"strconv"
-	"github.com/garfunkel/nasimport/constants"
-	"github.com/garfunkel/nasimport/mapregexp"
+	"../constants"
+	"github.com/garfunkel/go-mapregexp"
 	"github.com/krusty64/tvdb"
 	"github.com/StalkR/imdb"
 	"github.com/arbovm/levenshtein"
@@ -48,6 +49,7 @@ type NasImporter struct {
 	existingMovieFiles []string
 	existingMovieDirs map[string][]string
 	numVisibleResults int
+	tvdbWebSearchSeriesRegex *regexp.Regexp
 	wordRegex *regexp.Regexp
 	tvdbClient *tvdb.TVDB
 	imdbClient http.Client
@@ -93,6 +95,8 @@ func NewNasImporter() NasImporter {
 	// I didn't know this but an optional group after a variable length group leads to unexpected results.
 	importer.movieWithYearRegex = mapregexp.MustCompile(`(?P<name>.+?)(?P<year>\d{4})(?P<other>.*?)\.(?P<ext>[^\.]*)$`)
 	importer.movieWithoutYearRegex = mapregexp.MustCompile(`(?P<name>.+?)\.(?P<ext>[^\.]*)$`)
+
+	importer.tvdbWebSearchSeriesRegex = regexp.MustCompile(`(?P<before><a href="/\?tab=series&amp;id=)(?P<seriesId>\d+)(?P<after>\&amp;lid=\d*">)`)
 
 	importer.wordRegex = regexp.MustCompile("[^\\.\\-_\\+\\s]+")
 	importer.tvdbClient = tvdb.Open()
@@ -156,11 +160,20 @@ func (importer *NasImporter) detectTVShow(path string) (order ScoreItems, tvShow
 	// Split name of tv show into words, and find the most probable results.
 	tvShowWords := importer.wordRegex.FindAllString(tvShowFields["name"], -1)
 	order = importer.getDirMatchOrder(importer.existingTVShowDirs, tvShowWords)
-	probableTitle := strings.Join(tvShowWords, " ")
+	//probableTitle := strings.Join(tvShowWords, " ")
 
 	// Search TVDB for results.
-	rawSeries, _ := importer.tvdbClient.GetSeries(probableTitle, "")
-	tvShowTVDBResults, _ = tvdb.ParseDetailSeriesData(rawSeries)
+	/*seriesIds := importer.WebSearchSeries(probableTitle)
+
+	rawSeries, _ := importer.tvdbClient.GetDetailSeriesById(seriesIds[0], "")
+
+	fmt.Println(string(rawSeries))
+
+	tvShowTVDBResults, err = tvdb.ParseDetailSeriesData(rawSeries)
+
+	fmt.Printf("%s - %#v - %#v\n", probableTitle, tvShowTVDBResults, err)
+	*/
+	//os.Exit(0)
 
 	return
 }
@@ -224,6 +237,8 @@ func (importer *NasImporter) detectMovie(path string) (order ScoreItems, movieFi
 	// Search IMDB for results.
 	// Ignore error, it seems that if no results are found we get an error.
 	movieIMDBResults, _ = imdb.SearchTitle(&importer.imdbClient, probableTitle)
+
+	fmt.Printf("%s - %#v\n", probableTitle, movieIMDBResults)
 
 	return
 }
