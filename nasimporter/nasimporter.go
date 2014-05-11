@@ -10,21 +10,14 @@ import (
 	"fmt"
 	"os"
 	//"log"
-	"math"
 	"net/http"
 	"strings"
 	"strconv"
-	"../constants"
+	"github.com/garfunkel/nasimport/constants"
 	"github.com/garfunkel/go-mapregexp"
-	"github.com/krusty64/tvdb"
+	"github.com/garfunkel/go-tvdb"
 	"github.com/StalkR/imdb"
 	"github.com/arbovm/levenshtein"
-)
-
-const (
-	TVRoot = constants.MediaRoot + "TV"
-	DocumentaryRoot = constants.MediaRoot + "Documentaries"
-	MovieRoot = constants.MediaRoot + "Movies"
 )
 
 type MediaType int
@@ -35,6 +28,18 @@ const (
 	Movie
 )
 
+type MediaSource int
+
+const (
+	Unknown MediaSource = iota
+	TVTVDB
+	DocumentaryTVDB
+	MovieIMDB
+	MovieLocal
+	TVLocal
+	DocumentaryLocal
+)
+
 type NasImporter struct {
 	tvShowRegex *mapregexp.MapRegexp
 	singleDocumentaryRegex *mapregexp.MapRegexp
@@ -43,15 +48,14 @@ type NasImporter struct {
 	yearDocumentaryRegex *mapregexp.MapRegexp
 	movieWithYearRegex *mapregexp.MapRegexp
 	movieWithoutYearRegex *mapregexp.MapRegexp
-	existingTVShowDirs map[string][]string
+	existingTVShowDirs []string
 	existingDocumentaryFiles []string
-	existingDocumentaryDirs map[string][]string
+	existingDocumentaryDirs []string
 	existingMovieFiles []string
-	existingMovieDirs map[string][]string
+	existingMovieDirs []string
 	numVisibleResults int
 	tvdbWebSearchSeriesRegex *regexp.Regexp
 	wordRegex *regexp.Regexp
-	tvdbClient *tvdb.TVDB
 	imdbClient http.Client
 }
 
@@ -59,6 +63,8 @@ type ScoreItem struct {
 	value string
 	words []string
 	score int
+	source MediaSource
+	data interface{}
 }
 
 type ImportChoice struct {
@@ -74,7 +80,13 @@ func (scoreItems ScoreItems) Len() int {
 }
 
 func (scoreItems ScoreItems) Less(i, j int) bool {
-	return scoreItems[i].score < scoreItems[j].score
+	less := scoreItems[i].score < scoreItems[j].score
+
+	if scoreItems[i].score != scoreItems[j].score {
+		return less
+	} else {
+		return scoreItems[i].source < scoreItems[j].source
+	}
 }
 
 func (scoreItems ScoreItems) Swap(i, j int) {
@@ -99,7 +111,6 @@ func NewNasImporter() NasImporter {
 	importer.tvdbWebSearchSeriesRegex = regexp.MustCompile(`(?P<before><a href="/\?tab=series&amp;id=)(?P<seriesId>\d+)(?P<after>\&amp;lid=\d*">)`)
 
 	importer.wordRegex = regexp.MustCompile("[^\\.\\-_\\+\\s]+")
-	importer.tvdbClient = tvdb.Open()
 
 	importer.ReadExistingMedia()
 
@@ -107,16 +118,17 @@ func NewNasImporter() NasImporter {
 }
 
 func (importer *NasImporter) ReadExistingMedia() (err error) {
-	_, importer.existingTVShowDirs, err = importer.getFilesDirs(TVRoot)
-	importer.existingDocumentaryFiles, importer.existingDocumentaryDirs, err = importer.getFilesDirs(DocumentaryRoot)
-	importer.existingMovieFiles, importer.existingMovieDirs, err = importer.getFilesDirs(MovieRoot)
+	_, importer.existingTVShowDirs, err = importer.getFilesDirs(constants.TVRoot)
+	importer.existingDocumentaryFiles, importer.existingDocumentaryDirs, err = importer.getFilesDirs(constants.DocumentaryRoot)
+	importer.existingMovieFiles, importer.existingMovieDirs, err = importer.getFilesDirs(constants.MovieRoot)
 
 	return
 }
 
-func (importer *NasImporter) getFilesDirs(path string) (files []string, dirs map[string][]string, err error) {
+func (importer *NasImporter) getFilesDirs(path string) (files []string, dirs []string, err error) {
 	allFiles, err := filepath.Glob(filepath.Join(path, "*"))
-	dirs = make(map[string][]string)
+	//dirs = make(map[string][]string)
+	//files = make(map[string][]string)
 
 	if err != nil {
 		return
@@ -137,48 +149,69 @@ func (importer *NasImporter) getFilesDirs(path string) (files []string, dirs map
 
 		switch mode := stat.Mode(); {
 			case mode.IsDir():
-				dirs[allFile] = importer.wordRegex.FindAllString(filepath.Base(allFile), -1)
+				dirs = append(dirs, filepath.Base(allFile))
+				//dirs[filepath.Base(allFile)] = importer.wordRegex.FindAllString(filepath.Base(allFile), -1)
 
 			case mode.IsRegular():
-				files = append(files, allFile)
+				files = append(files, filepath.Base(allFile))
+				//files[filepath.Base(allFile)] = importer.wordRegex.FindAllString(filepath.Base(allFile), -1)
 		}
 	}
 
 	return
 }
 
-func (importer *NasImporter) detectTVShow(path string) (order ScoreItems, tvShowFields map[string]string, tvShowTVDBResults *tvdb.GetDetailSeriesData, err error) {
+func (importer *NasImporter) detectTVShowFields(path string) (tvShowFields map[string]string, err error) {
 	tvShowFields = importer.tvShowRegex.FindStringSubmatchMap(path)
 
 	if tvShowFields == nil {
 		err = errors.New("Not a TV show")
-
-		return
 	}
-
-	// If we get here, we may have a new/existing TV show, but it could also still be a doco.
-	// Split name of tv show into words, and find the most probable results.
-	tvShowWords := importer.wordRegex.FindAllString(tvShowFields["name"], -1)
-	order = importer.getDirMatchOrder(importer.existingTVShowDirs, tvShowWords)
-	//probableTitle := strings.Join(tvShowWords, " ")
-
-	// Search TVDB for results.
-	/*seriesIds := importer.WebSearchSeries(probableTitle)
-
-	rawSeries, _ := importer.tvdbClient.GetDetailSeriesById(seriesIds[0], "")
-
-	fmt.Println(string(rawSeries))
-
-	tvShowTVDBResults, err = tvdb.ParseDetailSeriesData(rawSeries)
-
-	fmt.Printf("%s - %#v - %#v\n", probableTitle, tvShowTVDBResults, err)
-	*/
-	//os.Exit(0)
 
 	return
 }
 
-func (importer *NasImporter) detectDocumentary(path string) (order ScoreItems, documentaryFields map[string]string, documentaryTVDBResults *tvdb.GetDetailSeriesData, err error) {
+func (importer *NasImporter) detectTVShow(name string) (order ScoreItems, err error) {
+	// If we get here, we may have a new/existing TV show, but it could also still be a doco.
+	// Split name of tv show into words, and find the most probable results.
+	order = importer.getLevenshteinOrder(importer.existingTVShowDirs, name)
+
+	return
+}
+
+func (importer *NasImporter) detectTvdbSeries(name, genre string) (seriesList tvdb.SeriesList, err error) {
+	words := importer.wordRegex.FindAllString(name, -1)
+	probableTitle := strings.Join(words, " ")
+
+	// Search TVDB for results.
+	seriesList, err = tvdb.SearchSeries(probableTitle, importer.numVisibleResults)
+
+	if genre != "" {
+		genreSeriesList := tvdb.SeriesList{}
+		negate := false
+
+		if genre[0] == '!' {
+			negate = true
+			genre = genre[1 :]
+		}
+
+		for _, series := range seriesList.Series {
+			for _, seriesGenre := range series.Genre {
+				if (strings.ToLower(genre) == strings.ToLower(seriesGenre)) != negate {
+					genreSeriesList.Series = append(genreSeriesList.Series, series)
+
+					break
+				}
+			}
+		}
+
+		seriesList = genreSeriesList
+	}
+
+	return
+}
+
+func (importer *NasImporter) detectDocumentaryFields(path string) (documentaryFields map[string]string, err error) {
 	documentaryRegexes := [...]*mapregexp.MapRegexp{
 		importer.seasonDocumentaryRegex,
 		importer.yearDocumentaryRegex,
@@ -194,14 +227,6 @@ func (importer *NasImporter) detectDocumentary(path string) (order ScoreItems, d
 			continue
 		}
 
-		documentaryWords := importer.wordRegex.FindAllString(documentaryFields["name"], -1)
-		order = importer.getDirMatchOrder(importer.existingDocumentaryDirs, documentaryWords)
-		probableTitle := strings.Join(documentaryWords, " ")
-
-		// Search TVDB for results.
-		rawSeries, _ := importer.tvdbClient.GetSeries(probableTitle, "")
-		documentaryTVDBResults, _ = tvdb.ParseDetailSeriesData(rawSeries)
-
 		return
 	}
 
@@ -210,7 +235,13 @@ func (importer *NasImporter) detectDocumentary(path string) (order ScoreItems, d
 	return
 }
 
-func (importer *NasImporter) detectMovie(path string) (order ScoreItems, movieFields map[string]string, movieIMDBResults []imdb.Title, err error) {
+func (importer *NasImporter) detectDocumentary(name string) (order ScoreItems, err error) {
+	order = importer.getLevenshteinOrder(importer.existingDocumentaryDirs, name)
+
+	return
+}
+
+func (importer *NasImporter) detectMovieFields(path string) (movieFields map[string]string, err error) {
 	movieFields = importer.movieWithYearRegex.FindStringSubmatchMap(path)
 
 	if movieFields == nil {
@@ -219,39 +250,48 @@ func (importer *NasImporter) detectMovie(path string) (order ScoreItems, movieFi
 
 	if movieFields == nil {
 		err = errors.New("Not a movie")
-
-		return
 	}
 
-	movieWords := importer.wordRegex.FindAllString(movieFields["name"], -1)
-	order = importer.getDirMatchOrder(importer.existingMovieDirs, movieWords)
+	return
+}
+
+func (importer *NasImporter) detectMovie(name string) (order ScoreItems, err error) {
+	order = importer.getLevenshteinOrder(importer.existingMovieDirs, name)
+
+	return
+}
+
+func (importer *NasImporter) detectIMDBMovie(name string) (movieIMDBResults []imdb.Title, err error) {
+	movieWords := importer.wordRegex.FindAllString(name, -1)
 	probableTitle := strings.Join(movieWords, " ")
-
-	// If we have a year, use it to aid our search.z
-	year, ok := movieFields["year"]
-
-	if ok {
-		probableTitle += " " + year
-	}
 
 	// Search IMDB for results.
 	// Ignore error, it seems that if no results are found we get an error.
 	movieIMDBResults, _ = imdb.SearchTitle(&importer.imdbClient, probableTitle)
 
-	fmt.Printf("%s - %#v\n", probableTitle, movieIMDBResults)
-
 	return
 }
 
-func (importer *NasImporter) getDirMatchOrder(dirMap map[string][]string, words []string) (order ScoreItems) {
-	order = make(ScoreItems, len(dirMap))
+func (importer *NasImporter) getLevenshteinDistance(string1, string2 string) int {
+	string1Words := importer.wordRegex.FindAllString(string1, -1)
+	joinedString1Words := strings.Join(string1Words, " ")
+	string2Words := importer.wordRegex.FindAllString(string2, -1)
+	joinedString2Words := strings.Join(string2Words, " ")
+
+	return levenshtein.Distance(strings.ToLower(joinedString1Words), strings.ToLower(joinedString2Words))
+}
+
+func (importer *NasImporter) getLevenshteinOrder(candidates []string, target string) (order ScoreItems) {
+	targetWords := importer.wordRegex.FindAllString(target, -1)
+	joinedTargetWords := strings.Join(targetWords, " ")
+	order = make(ScoreItems, len(candidates))
 	orderIndex := 0
 
-	for dir, dirWords := range dirMap {
-		scoreItem := ScoreItem{value: dir, words: dirWords}
-		joinedDirWords := strings.Join(dirWords, " ")
-		joinedWords := strings.Join(words, " ")
-		scoreItem.score = levenshtein.Distance(joinedWords, joinedDirWords)
+	for _, candidate := range candidates {
+		candidateWords := importer.wordRegex.FindAllString(candidate, -1)
+		scoreItem := ScoreItem{value: candidate, words: candidateWords}
+		joinedCandidateWords := strings.Join(candidateWords, " ")
+		scoreItem.score = levenshtein.Distance(strings.ToLower(joinedTargetWords), strings.ToLower(joinedCandidateWords))
 		order[orderIndex] = scoreItem
 		orderIndex++
 	}
@@ -262,21 +302,53 @@ func (importer *NasImporter) getDirMatchOrder(dirMap map[string][]string, words 
 }
 
 func (importer *NasImporter) importMKV(path, outPath string) {
-
+	fmt.Println(path)
+	fmt.Println(outPath)
 }
 
-func (importer *NasImporter) processTVShow(path string, fileFields map[string]string, metadata *tvdb.GetDetailSeriesData) {
-	seasonNum, _ := strconv.Atoi(fileFields["series"])
-	episodeNum, _ := strconv.Atoi(fileFields["episode"])
-	episodeData, _ := importer.tvdbClient.GetEpisodeBySeasonEp(metadata.Series[0].Id, seasonNum, episodeNum, "en")
-	episode, _ := tvdb.ParseSingleEpisode(episodeData)
-	outPath := fmt.Sprintf("%s/%s/Season %02d/%s S%02dE%02d - %s.mkv", TVRoot, metadata.Series[0].SeriesName, seasonNum, metadata.Series[0].SeriesName, seasonNum, episodeNum, episode.Episode.EpisodeName)
+func (importer *NasImporter) importTV(path string, fileFields map[string]string, data interface{}) {
+	seasonNum, _ := strconv.ParseUint(fileFields["series"], 10, 64)
+	episodeNum, _ := strconv.ParseUint(fileFields["episode"], 10, 64)
+	seriesName := ""
+	episodeName := ""
+
+	switch data.(type) {
+		case tvdb.Series:
+			castData := data.(tvdb.Series)
+			seriesName = castData.SeriesName
+
+			if castData.Seasons == nil {
+				castData.GetDetail()
+			}
+
+			season, ok := castData.Seasons[seasonNum]
+
+			if !ok {
+
+			} else {
+				for _, episode := range season {
+					if episode.EpisodeNumber == episodeNum {
+						episodeName = episode.EpisodeName
+
+						break
+					}
+				}
+			}
+		case string:
+			seriesName = data.(string)
+	}
+
+	outPath := fmt.Sprintf("%s/%s/Season %02d/%s S%02dE%02d - %s.mkv", constants.TVRoot, seriesName, seasonNum, seriesName, seasonNum, episodeNum, episodeName)
 
 	importer.importMKV(path, outPath)
 }
 
-func (importer *NasImporter) processDocumentary(path string, fileFields map[string]string, metadata *tvdb.GetDetailSeriesData) {
-	println("here");
+func (importer *NasImporter) importDocumentary(path string, fileFields map[string]string, data interface{}) {
+	
+}
+
+func (importer *NasImporter) importMovie(path string, fileFields map[string]string, data interface{}) {
+
 }
 
 func (importer *NasImporter) Import(path string) (err error) {
@@ -285,81 +357,186 @@ func (importer *NasImporter) Import(path string) (err error) {
 	fmt.Printf("Importing %s\n", path)
 	fmt.Printf("Attempting to detect if this is a TV show...\n")
 
-	tvShowOrder, tvShowFields, tvShowTVDBResults, err := importer.detectTVShow(file)
+	tvShowFields, err := importer.detectTVShowFields(file)
+	tvShowOrder := ScoreItems{}
+	tvShowTVDBResults := tvdb.SeriesList{}
+
+	if err == nil {
+		tvShowOrder, err = importer.detectTVShow(tvShowFields["name"])
+		tvShowTVDBResults, err = importer.detectTvdbSeries(tvShowFields["name"], "!documentary")
+	}
 
 	fmt.Printf("Attempting to detect if this is a documentary...\n")
 
-	documentaryOrder, documentaryFields, documentaryTVDBResults, err := importer.detectDocumentary(file)
+	documentaryFields, err := importer.detectDocumentaryFields(file)
+	documentaryOrder, err := importer.detectDocumentary(documentaryFields["name"])
+	documentaryTVDBResults, err := importer.detectTvdbSeries(documentaryFields["name"], "documentary")
 
 	fmt.Printf("Attempting to detect if this is a movie...\n")
 
-	movieOrder, movieFields, movieIMDBResults, err := importer.detectMovie(file)
+	movieFields, err := importer.detectMovieFields(file)
+	movieOrder, err := importer.detectMovie(movieFields["name"])
+	movieName := movieFields["name"]
+
+	// If we have a year, use it to aid our search.z
+	movieYear, ok := movieFields["year"]
+
+	if ok {
+		movieName += " (" + movieYear + ")"
+	}
+
+	movieIMDBResults, err := importer.detectIMDBMovie(movieName)
 
 	// Logic to decide best type of media.
-	fmt.Printf("TV FIELDS: %#v\nDOC FIELDS: %#v\nMOVIE FIELDS: %#v\n", tvShowFields, documentaryFields, movieFields)
+	//fmt.Printf("TV FIELDS: %#v\nDOC FIELDS: %#v\nMOVIE FIELDS: %#v\n", tvShowFields, documentaryFields, movieFields)
 
-	matchId := 1
-
-	fmt.Printf("Most likely TV show matches:\n")
+	fmt.Printf("Most likely TV show matches (local):\n")
 
 	//choices := make(map[int]ImportChoice)
+	absoluteOrder := ScoreItems{}
 
-	for index := 0; index < int(math.Min(float64(importer.numVisibleResults), float64(len(tvShowOrder)))); index++ {
-		fmt.Printf("\t%v | %v\t%v\n", matchId, tvShowOrder[index].score, filepath.Base(tvShowOrder[index].value))
-
-		matchId++
-	}
-
-	fmt.Printf("\nMost likely TV show matches (TVDB):\n")
-
-	for index := 0; index < int(math.Min(float64(importer.numVisibleResults), float64(len(tvShowTVDBResults.Series)))); index++ {
-		fmt.Printf("\t%v | %v\t%v\n", matchId, tvShowTVDBResults.Series[index].Id, tvShowTVDBResults.Series[index].SeriesName)
-
-		matchId++
-	}
-
-	fmt.Printf("\nMost likely documentary matches:\n")
-
-	for index := 0; index < int(math.Min(float64(importer.numVisibleResults), float64(len(tvShowOrder)))); index++ {
-		fmt.Printf("\t%v | %v\t%v\n", matchId, documentaryOrder[index].score, filepath.Base(documentaryOrder[index].value))
-
-		matchId++
-	}
-
-	fmt.Printf("\nMost likely documentary matches (TVDB):\n")
-
-	for index := 0; index < int(math.Min(float64(importer.numVisibleResults), float64(len(documentaryTVDBResults.Series)))); index++ {
-		fmt.Printf("\t%v | %v\t%v\n", matchId, documentaryTVDBResults.Series[index].Id, documentaryTVDBResults.Series[index].SeriesName)
-
-		matchId++
-	}
-
-	fmt.Printf("\nMost likely movie matches:\n")
-
-	for index := 0; index < int(math.Min(float64(importer.numVisibleResults), float64(len(movieOrder)))); index++ {
-		fmt.Printf("\t%v | %v\t%v\n", matchId, movieOrder[index].score, movieOrder[index].value)
-
-		matchId++
-	}
-
-	fmt.Printf("\nMost likely movie matches (IMDB):\n")
-
-	for index := 0; index < int(math.Min(float64(importer.numVisibleResults), float64(len(movieIMDBResults)))); index++ {
-		fmt.Printf("\t%v | %v\t%v (%v)\n", matchId, movieIMDBResults[index].ID, movieIMDBResults[index].Name, movieIMDBResults[index].Year)
-
-		matchId++
-	}
-
-	fmt.Printf("Enter ID of result or press enter to override: ")
-
-	numChars, err := fmt.Scanf("%d", &matchId)
-
-	if err != nil {
-		if numChars == 0 {
-
-		} else {
-			
+	for index, tvShow := range tvShowOrder {
+		if index < importer.numVisibleResults {
+			fmt.Printf("\t%v\n", tvShow.value)
 		}
+
+		tvShow.source = TVLocal
+		tvShow.data = tvShow.value
+		absoluteOrder = append(absoluteOrder, tvShow)
+	}
+
+	fmt.Printf("\nMost likely TV show matches (TheTVDB):\n")
+
+	for index, tvShowTVDBResult := range tvShowTVDBResults.Series {
+		score := importer.getLevenshteinDistance(tvShowFields["name"], tvShowTVDBResult.SeriesName)
+		scoreItem := ScoreItem{value: tvShowTVDBResult.SeriesName, score: score, source: TVTVDB, data: tvShowTVDBResult}
+		absoluteOrder = append(absoluteOrder, scoreItem)
+
+		if index < importer.numVisibleResults {
+			fmt.Printf("\t%v\n", tvShowTVDBResult.SeriesName)
+		}
+	}
+
+	fmt.Printf("\nMost likely documentary matches (local):\n")
+
+	for index, documentary := range documentaryOrder {
+		if index < importer.numVisibleResults {
+			fmt.Printf("\t%v\n", documentary.value)
+		}
+
+		documentary.source = DocumentaryLocal
+		documentary.data = documentary.value
+		absoluteOrder = append(absoluteOrder, documentary)
+	}
+
+	fmt.Printf("\nMost likely documentary matches (TheTVDB):\n")
+
+	for index, documentaryTVDBResult := range documentaryTVDBResults.Series {
+		score := importer.getLevenshteinDistance(documentaryFields["name"], documentaryTVDBResult.SeriesName)
+		scoreItem := ScoreItem{value: documentaryTVDBResult.SeriesName, score: score, source: DocumentaryTVDB, data: documentaryTVDBResult}
+		absoluteOrder = append(absoluteOrder, scoreItem)
+
+		if index < importer.numVisibleResults {
+			fmt.Printf("\t%v\n", documentaryTVDBResult.SeriesName)
+		}
+	}
+
+	fmt.Printf("\nMost likely movie matches (local):\n")
+
+	for index, movie := range movieOrder {
+		if index < importer.numVisibleResults {
+			fmt.Printf("\t%v\n", movie.value)
+		}
+
+		movie.source = MovieLocal
+		movie.data = movie.value
+		absoluteOrder = append(absoluteOrder, movie)
+	}
+
+	fmt.Printf("\nMost likely movie matches (IMDb):\n")
+
+	for index, movieIMDBResult := range movieIMDBResults {
+		score := importer.getLevenshteinDistance(movieFields["name"], movieIMDBResult.Name)
+		scoreItem := ScoreItem{value: movieIMDBResult.Name, score: score, source: MovieIMDB, data: movieIMDBResult}
+		absoluteOrder = append(absoluteOrder, scoreItem)
+
+		if index < importer.numVisibleResults {
+			fmt.Printf("\t%v (%v)\n", movieIMDBResult.Name, movieIMDBResult.Year)
+		}
+	}
+
+	sort.Sort(absoluteOrder)
+
+	fmt.Printf("\nMost likely overall matches:\n")
+
+	for index, result := range absoluteOrder {
+		if index < importer.numVisibleResults {
+			source := "unknown"
+
+			switch result.source {
+				case TVLocal:
+					source = "local TV show"
+				case DocumentaryLocal:
+					source = "local documentary"
+				case MovieLocal:
+					source = "local movie"
+				case TVTVDB:
+					series := result.data.(tvdb.Series)
+					source = fmt.Sprintf("TheTVDB TV show (ID: %v)", series.Id)
+				case DocumentaryTVDB:
+					series := result.data.(tvdb.Series)
+					source = fmt.Sprintf("TheTVDB documentary (ID: %v)", series.Id)
+				case MovieIMDB:
+					movie := result.data.(imdb.Title)
+					source = fmt.Sprintf("IMDb movie (ID: %v)", movie.ID)
+			}
+
+			if result.source == MovieIMDB {
+				movie := result.data.(imdb.Title)
+
+				fmt.Printf("\t%v | %v (%v)\n\t\t%v\n", index + 1, result.value, movie.Year, source)
+			} else {
+				fmt.Printf("\t%v | %v\n\t\t%v\n", index + 1, result.value, source)
+			}
+		} else {
+			break
+		}
+	}
+
+	matchId := 0
+
+	for {
+		fmt.Printf("\nEnter ID of result or press enter to override: ")
+
+		_, err := fmt.Scanf("%d", &matchId)
+
+		if err != nil || matchId > importer.numVisibleResults {
+			fmt.Printf("\nSorry, invalid ID. Try again.\n")
+		} else {
+			break
+		}
+	}
+
+	match := absoluteOrder[matchId - 1]
+
+	switch match.source {
+		case TVLocal:
+			importer.importTV(path, tvShowFields, match.data)
+
+		case TVTVDB:
+			importer.importTV(path, tvShowFields, match.data)
+
+		case DocumentaryLocal:
+			importer.importDocumentary(path, documentaryFields, match.data)
+
+		case DocumentaryTVDB:
+			importer.importDocumentary(path, documentaryFields, match.data)
+
+		case MovieLocal:
+			importer.importMovie(path, movieFields, match.data)
+
+		case MovieIMDB:
+			importer.importMovie(path, movieFields, match.data)
 	}
 
 	return
