@@ -5,8 +5,8 @@
 		"movies": "/home/simon/dataFRED/Movies"
 	},
 	"matroska_muxers": {
-		"mkvmerge": "/opt/local/bin/mkvmerge",
-		"ffmpeg": "/opt/local/bin/ffmpeg"
+		"mkvmerge": "/usr/bin/mkvmerge",
+		"ffmpeg": "/usr/bin/ffmpeg"
 	},
 	"interface": {
 		"num_visible_results": 5

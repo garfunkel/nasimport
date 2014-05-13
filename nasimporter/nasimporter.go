@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"strings"
 	"strconv"
+	"os/exec"
+	"bytes"
 	"github.com/garfunkel/go-mapregexp"
 	"github.com/garfunkel/go-tvdb"
 	"github.com/StalkR/imdb"
@@ -119,7 +121,7 @@ func NewNasImporter(configPath string) (importer NasImporter, err error) {
 
 	importer.ReadConfig()
 
-	importer.tvShowRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_)?[sS]?(?P<series>\d+)[eE]?(?P<episode>\d{2,})(\.|-|_)?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
+	importer.tvShowRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_)?[sS]?(?P<series>\d+)[eE]?(?P<episode>\d+)(\.|-|_)?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
 	importer.singleDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)\.(?P<ext>[^\.]*)$`)
 	importer.multiDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_)?([pP][tT]|part|Part|[eE]|episode|Episode).*?(?P<episode>\d+)\.(?P<ext>[^\.]*)$`)
 	importer.yearDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_)?((year|Year).*)?(?P<year>\d{4}).*?([eE]|episode|Episode|part|Part|pt|PT|Pt).*?(?P<episode>\d+)(\.|-|_)?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
@@ -330,16 +332,80 @@ func (importer *NasImporter) getLevenshteinOrder(candidates []string, target str
 	return
 }
 
-func (importer *NasImporter) importMKV(path, outPath string) {
-	fmt.Println(path)
-	fmt.Println(outPath)
+func (importer *NasImporter) importMKVUsingMKVMerge(path, outPath string) (err error) {
+	cmd := exec.Command(importer.config.MatroskaMuxers.MKVMerge, "-o", outPath, path)
+	var stdout, stderr bytes.Buffer
+
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err = cmd.Run(); err != nil {
+		err = errors.New(importer.config.MatroskaMuxers.MKVMerge + " exited with error: " + strings.TrimSpace(stdout.String()))
+	}
+
+	return
 }
 
-func (importer *NasImporter) importTV(path string, fileFields map[string]string, data interface{}) {
-	seasonNum, _ := strconv.ParseUint(fileFields["series"], 10, 64)
-	episodeNum, _ := strconv.ParseUint(fileFields["episode"], 10, 64)
+func (importer *NasImporter) importMKVUsingFFMPEG(path, outPath string) (err error) {
+	cmd := exec.Command(importer.config.MatroskaMuxers.FFMPEG, "-fflags", "+genpts", "-i", path, "-codec", "copy", "-y", outPath)
+	var stdout, stderr bytes.Buffer
+
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err = cmd.Run(); err != nil {
+		err = errors.New(importer.config.MatroskaMuxers.FFMPEG + " exited with error: " + strings.TrimSpace(stderr.String()))
+	}
+
+	return
+}
+
+func (importer *NasImporter) importMKV(path, outPath string) (err error) {
+	if _, err = os.Stat(outPath); !os.IsNotExist(err) {
+		return
+	}
+
+	err = os.MkdirAll(filepath.Dir(outPath), os.ModeDir | 0755)
+
+	if err != nil {
+		return
+	}
+
+	err = importer.importMKVUsingMKVMerge(path, outPath)
+
+	if err == nil {
+		return 
+	}
+
+	fmt.Println(err)
+
+	err = importer.importMKVUsingFFMPEG(path, outPath)
+
+	if err == nil {
+		return
+	}
+
+	fmt.Println(err)
+
+	return
+}
+
+func (importer *NasImporter) importTV(path string, fileFields map[string]string, data interface{}) (err error) {
+	seasonNum, err := strconv.ParseUint(fileFields["series"], 10, 64)
+
+	if err != nil {
+		return
+	}
+
+	episodeNum, err := strconv.ParseUint(fileFields["episode"], 10, 64)
+
+	if err != nil {
+		return
+	}
+
 	seriesName := ""
 	episodeName := ""
+	outPath := ""
 
 	switch data.(type) {
 		case tvdb.Series:
@@ -353,7 +419,9 @@ func (importer *NasImporter) importTV(path string, fileFields map[string]string,
 			season, ok := castData.Seasons[seasonNum]
 
 			if !ok {
+				err = errors.New(fmt.Sprintf("Season %v doesn't exist on TheTVDB.", seasonNum))
 
+				return
 			} else {
 				for _, episode := range season {
 					if episode.EpisodeNumber == episodeNum {
@@ -363,24 +431,49 @@ func (importer *NasImporter) importTV(path string, fileFields map[string]string,
 					}
 				}
 			}
+
+			if episodeName == "" {
+				err = errors.New(fmt.Sprintf("Episode %v doesn't exist on TheTVDB.", episodeNum))
+			}
+
+			outPath = fmt.Sprintf("%s/%s/Season %02d/%s S%02dE%02d - %s.mkv", importer.config.MediaDirs.TVDir, seriesName, seasonNum, seriesName, seasonNum, episodeNum, episodeName)
 		case string:
 			seriesName = data.(string)
+			outPath = fmt.Sprintf("%s/%s/Season %02d/%s S%02dE%02d.mkv", importer.config.MediaDirs.TVDir, seriesName, seasonNum, seriesName, seasonNum, episodeNum)
 	}
 
-	outPath := fmt.Sprintf("%s/%s/Season %02d/%s S%02dE%02d - %s.mkv", importer.config.MediaDirs.TVDir, seriesName, seasonNum, seriesName, seasonNum, episodeNum, episodeName)
+	err = importer.importMKV(path, outPath)
 
-	importer.importMKV(path, outPath)
+	return
 }
 
-func (importer *NasImporter) importDocumentary(path string, fileFields map[string]string, data interface{}) {
-	
+func (importer *NasImporter) importDocumentary(path string, fileFields map[string]string, data interface{}) (err error) {
+	return
 }
 
-func (importer *NasImporter) importMovie(path string, fileFields map[string]string, data interface{}) {
-
+func (importer *NasImporter) importMovie(path string, fileFields map[string]string, data interface{}) (err error) {
+	return
 }
 
 func (importer *NasImporter) Import(path string) (err error) {
+	path, err = filepath.Abs(path)
+
+	if err != nil {
+		return
+	}
+
+	fileInfo, err := os.Stat(path)
+
+	if os.IsNotExist(err) {
+		return
+	}
+
+	if fileInfo.IsDir() {
+		err = errors.New(fmt.Sprintf("%v is a directory.", path))
+
+		return
+	}
+
 	file := filepath.Base(path)
 
 	fmt.Printf("Importing %s\n", path)
@@ -582,7 +675,7 @@ func (importer *NasImporter) Import(path string) (err error) {
 
 		_, err := fmt.Scanf("%d", &matchId)
 
-		if err != nil || matchId > importer.config.Interface.NumVisibleResults {
+		if err != nil || matchId > importer.config.Interface.NumVisibleResults || matchId < 1 {
 			fmt.Printf("\nSorry, invalid ID. Try again.\n")
 		} else {
 			break
@@ -593,22 +686,22 @@ func (importer *NasImporter) Import(path string) (err error) {
 
 	switch match.source {
 		case TVLocal:
-			importer.importTV(path, tvShowFields, match.data)
+			err = importer.importTV(path, tvShowFields, match.data)
 
 		case TVTVDB:
-			importer.importTV(path, tvShowFields, match.data)
+			err = importer.importTV(path, tvShowFields, match.data)
 
 		case DocumentaryLocal:
-			importer.importDocumentary(path, documentaryFields, match.data)
+			err = importer.importDocumentary(path, documentaryFields, match.data)
 
 		case DocumentaryTVDB:
-			importer.importDocumentary(path, documentaryFields, match.data)
+			err = importer.importDocumentary(path, documentaryFields, match.data)
 
 		case MovieLocal:
-			importer.importMovie(path, movieFields, match.data)
+			err = importer.importMovie(path, movieFields, match.data)
 
 		case MovieIMDB:
-			importer.importMovie(path, movieFields, match.data)
+			err = importer.importMovie(path, movieFields, match.data)
 	}
 
 	return
