@@ -2,15 +2,24 @@ package main
 
 import (
 	"flag"
+	"log"
 	"github.com/garfunkel/nasimport/nasimporter"
 )
 
 func main() {
 	flag.Parse()
 
-	importer := nasimporter.NewNasImporter()
+	importer, err := nasimporter.NewNasImporter("config.json")
+
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	for _, path := range flag.Args() {
-		importer.Import(path)
+		err = importer.Import(path)
+
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 }

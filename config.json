@@ -1,0 +1,14 @@
+{
+	"media_dirs": {
+		"tv": "/home/simon/dataFRED/TV",
+		"documentaries": "/home/simon/dataFRED/Documentaries",
+		"movies": "/home/simon/dataFRED/Movies"
+	},
+	"matroska_muxers": {
+		"mkvmerge": "/opt/local/bin/mkvmerge",
+		"ffmpeg": "/opt/local/bin/ffmpeg"
+	},
+	"interface": {
+		"num_visible_results": 5
+	}
+}
