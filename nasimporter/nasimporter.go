@@ -59,10 +59,10 @@ type Config struct {
 }
 
 type NasImporter struct {
-	tvShowRegex *mapregexp.MapRegexp
+	tvShowRegex1 *mapregexp.MapRegexp
+	tvShowRegex2 *mapregexp.MapRegexp
 	singleDocumentaryRegex *mapregexp.MapRegexp
 	multiDocumentaryRegex *mapregexp.MapRegexp
-	seasonDocumentaryRegex *mapregexp.MapRegexp
 	yearDocumentaryRegex *mapregexp.MapRegexp
 	movieWithYearRegex *mapregexp.MapRegexp
 	movieWithoutYearRegex *mapregexp.MapRegexp
@@ -74,6 +74,7 @@ type NasImporter struct {
 	tvdbWebSearchSeriesRegex *regexp.Regexp
 	wordRegex *regexp.Regexp
 	imdbClient http.Client
+	automaticMode bool
 	configPath string
 	config Config
 }
@@ -112,7 +113,7 @@ func (scoreItems ScoreItems) Swap(i, j int) {
 	scoreItems[i], scoreItems[j] = scoreItems[j], scoreItems[i]
 }
 
-func NewNasImporter(configPath string) (importer NasImporter, err error) {
+func NewNasImporter(configPath string, automaticMode bool) (importer NasImporter, err error) {
 	importer.configPath, err = filepath.Abs(configPath)
 
 	if err != nil {
@@ -121,19 +122,20 @@ func NewNasImporter(configPath string) (importer NasImporter, err error) {
 
 	importer.ReadConfig()
 
-	importer.tvShowRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_)?[sS]?(?P<series>\d+)[eE]?(?P<episode>\d+)(\.|-|_)?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
+	importer.tvShowRegex1 = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)+?[sS](?P<series>\d+)[eE](?P<episode>\d+)(\.|-|_|\s)+?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
+	importer.tvShowRegex2 = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)+?(?P<series>\d+)(?P<episode>\d{2})(\.|-|_|\s)+?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
 	importer.singleDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)\.(?P<ext>[^\.]*)$`)
-	importer.multiDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_)?([pP][tT]|part|Part|[eE]|episode|Episode).*?(?P<episode>\d+)\.(?P<ext>[^\.]*)$`)
-	importer.yearDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_)?((year|Year).*)?(?P<year>\d{4}).*?([eE]|episode|Episode|part|Part|pt|PT|Pt).*?(?P<episode>\d+)(\.|-|_)?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
-	importer.seasonDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_)?[sS](?P<series>\d+)[eE](?P<episode>\d+)(\.|-|_)?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
+	importer.multiDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)+?([pP][tT]|part|Part|[eE]|episode|Episode).*?(?P<episode>\d+)\.(?P<ext>[^\.]*)$`)
+	importer.yearDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)+?((year|Year).*)?(?P<year>(19|[2-9]\d)\d{2}).*?([eE]|episode|Episode|part|Part|pt|PT|Pt).*?(?P<episode>\d+)(\.|-|_|\s)+?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
 
 	// I didn't know this but an optional group after a variable length group leads to unexpected results.
-	importer.movieWithYearRegex = mapregexp.MustCompile(`(?P<name>.+?)(?P<year>\d{4})(?P<other>.*?)\.(?P<ext>[^\.]*)$`)
+	importer.movieWithYearRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)+?(?P<year>(19|[2-9]\d)\d{2})(\.|-|_|\s)+?(?P<other>.*?)\.(?P<ext>[^\.]*)$`)
 	importer.movieWithoutYearRegex = mapregexp.MustCompile(`(?P<name>.+?)\.(?P<ext>[^\.]*)$`)
 
 	importer.tvdbWebSearchSeriesRegex = regexp.MustCompile(`(?P<before><a href="/\?tab=series&amp;id=)(?P<seriesId>\d+)(?P<after>\&amp;lid=\d*">)`)
 
 	importer.wordRegex = regexp.MustCompile("[^\\.\\-_\\+\\s]+")
+	importer.automaticMode = automaticMode
 
 	importer.ReadExistingMedia()
 
@@ -193,11 +195,23 @@ func (importer *NasImporter) getFilesDirs(path string) (files []string, dirs []s
 }
 
 func (importer *NasImporter) detectTVShowFields(path string) (tvShowFields map[string]string, err error) {
-	tvShowFields = importer.tvShowRegex.FindStringSubmatchMap(path)
-
-	if tvShowFields == nil {
-		err = errors.New("Not a TV show")
+	tvRegexes := [...]*mapregexp.MapRegexp{
+		importer.tvShowRegex1,
+		importer.tvShowRegex2,
 	}
+
+	// Try the different tvRegexes.
+	for _, tvRegex := range tvRegexes {
+		tvShowFields = tvRegex.FindStringSubmatchMap(path)
+
+		if tvShowFields == nil {
+			continue
+		}
+
+		return
+	}
+
+	err = errors.New("Not a TV show")
 
 	return
 }
@@ -244,7 +258,8 @@ func (importer *NasImporter) detectTvdbSeries(name, genre string) (seriesList tv
 
 func (importer *NasImporter) detectDocumentaryFields(path string) (documentaryFields map[string]string, err error) {
 	documentaryRegexes := [...]*mapregexp.MapRegexp{
-		importer.seasonDocumentaryRegex,
+		importer.tvShowRegex1,
+		importer.tvShowRegex2,
 		importer.yearDocumentaryRegex,
 		importer.multiDocumentaryRegex,
 		importer.singleDocumentaryRegex,
@@ -553,7 +568,7 @@ func (importer *NasImporter) Import(path string) (err error) {
 	}
 
 	// Logic to decide best type of media.
-	//fmt.Printf("TV FIELDS: %#v\nDOC FIELDS: %#v\nMOVIE FIELDS: %#v\n", tvShowFields, documentaryFields, movieFields)
+	fmt.Printf("TV FIELDS: %#v\nDOC FIELDS: %#v\nMOVIE FIELDS: %#v\n", tvShowFields, documentaryFields, movieFields)
 
 	fmt.Printf("Most likely TV show matches (local):\n")
 
@@ -668,17 +683,21 @@ func (importer *NasImporter) Import(path string) (err error) {
 		}
 	}
 
-	matchId := 0
+	matchId := 1
 
-	for {
-		fmt.Printf("\nEnter ID of result or press enter to override: ")
+	if importer.automaticMode {
+		fmt.Println("\nAutomatically choosing ID: 1")
+	} else {
+		for {
+			fmt.Printf("\nEnter ID: ")
 
-		_, err := fmt.Scanf("%d", &matchId)
+			_, err := fmt.Scanf("%d", &matchId)
 
-		if err != nil || matchId > importer.config.Interface.NumVisibleResults || matchId < 1 {
-			fmt.Printf("\nSorry, invalid ID. Try again.\n")
-		} else {
-			break
+			if err != nil || matchId > importer.config.Interface.NumVisibleResults || matchId < 1 {
+				fmt.Printf("\nSorry, invalid ID. Try again.\n")
+			} else {
+				break
+			}
 		}
 	}
 

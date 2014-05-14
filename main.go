@@ -7,9 +7,11 @@ import (
 )
 
 func main() {
+	automaticMode := flag.Bool("a", false, "automatic mode (accept best content guess)")
+
 	flag.Parse()
 
-	importer, err := nasimporter.NewNasImporter("config.json")
+	importer, err := nasimporter.NewNasImporter("config.json", *automaticMode)
 
 	if err != nil {
 		log.Fatal(err)
