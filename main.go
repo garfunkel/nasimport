@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"log"
+	"fmt"
 	"github.com/garfunkel/nasimport/nasimporter"
 )
 
@@ -17,11 +18,17 @@ func main() {
 		log.Fatal(err)
 	}
 
+	numImported := 0
+
 	for _, path := range flag.Args() {
 		err = importer.Import(path)
 
 		if err != nil {
 			log.Fatal(err)
+		} else {
+			numImported++
 		}
 	}
+
+	fmt.Printf("%v files imported.\n", numImported)
 }

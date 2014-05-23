@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"os/exec"
 	"bytes"
+	"runtime"
 	"github.com/garfunkel/go-mapregexp"
 	"github.com/garfunkel/go-tvdb"
 	"github.com/StalkR/imdb"
@@ -61,6 +62,8 @@ type Config struct {
 type NasImporter struct {
 	tvShowRegex1 *mapregexp.MapRegexp
 	tvShowRegex2 *mapregexp.MapRegexp
+	tvShowRegex3 *mapregexp.MapRegexp
+	tvShowRegex4 *mapregexp.MapRegexp
 	singleDocumentaryRegex *mapregexp.MapRegexp
 	multiDocumentaryRegex *mapregexp.MapRegexp
 	yearDocumentaryRegex *mapregexp.MapRegexp
@@ -122,15 +125,18 @@ func NewNasImporter(configPath string, automaticMode bool) (importer NasImporter
 
 	importer.ReadConfig()
 
-	importer.tvShowRegex1 = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)+?[sS](?P<series>\d+)[eE](?P<episode>\d+)(\.|-|_|\s)+?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
-	importer.tvShowRegex2 = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)+?(?P<series>\d+)(?P<episode>\d{2})(\.|-|_|\s)+?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
-	importer.singleDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)\.(?P<ext>[^\.]*)$`)
-	importer.multiDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)+?([pP][tT]|part|Part|[eE]|episode|Episode).*?(?P<episode>\d+)\.(?P<ext>[^\.]*)$`)
-	importer.yearDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)+?((year|Year).*)?(?P<year>(19|[2-9]\d)\d{2}).*?([eE]|episode|Episode|part|Part|pt|PT|Pt).*?(?P<episode>\d+)(\.|-|_|\s)+?(?P<other>.*)\.(?P<ext>[^\.]*)$`)
+	// /home/simon/dataFRED/Usenet/Downloads/never/Never.Mind.The.Buzzcocks.UK.S27E05.720p.HDTV.x264-thebeeb.nzb/never.mind.the.buzzcocks.uk.2705.720p.hdtv.x264-thebeeb.mkv
+	importer.tvShowRegex1 = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)+([\(\[]?(?P<year>\d{4})[\)\]]?).*?(\.|-|_|\s)+[sS](?P<season>\d+).*?[eE](?P<episode>\d+)(\.|-|_|\s)*(?P<other>.*?)\s*\.(?P<ext>[^\.]*)$`)
+	importer.tvShowRegex2 = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)*[sS](?P<season>\d+).*?[eE](?P<episode>\d+)(\.|-|_|\s)*(?P<other>.*?)\s*\.(?P<ext>[^\.]*)$`)
+	importer.tvShowRegex3 = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)+([\(\[]?(?P<year>\d{4})[\)\]]?).*?(\.|-|_|\s)+(?P<season>\d+)[xX]?(?P<episode>\d{2})(\.|-|_|\s)*(?P<other>.*?)\s*\.(?P<ext>[^\.]*)$`)
+	importer.tvShowRegex4 = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)*(?P<season>\d+)[xX]?(?P<episode>\d{2})(\.|-|_|\s)*(?P<other>.*?)\s*\.(?P<ext>[^\.]*)$`)
+	importer.singleDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)\s*\.(?P<ext>[^\.]*)$`)
+	importer.multiDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)*([pP][tT]|part|Part|[eE]|episode|Episode).*?(?P<episode>\d+)\s*\.(?P<ext>[^\.]*)$`)
+	importer.yearDocumentaryRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)*((year|Year).*)?(?P<year>(19|[2-9]\d)\d{2}).*?([eE]|episode|Episode|part|Part|pt|PT|Pt).*?(?P<episode>\d+)(\.|-|_|\s)*(?P<other>.*?)\s*\.(?P<ext>[^\.]*)$`)
 
 	// I didn't know this but an optional group after a variable length group leads to unexpected results.
-	importer.movieWithYearRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)+?(?P<year>(19|[2-9]\d)\d{2})(\.|-|_|\s)+?(?P<other>.*?)\.(?P<ext>[^\.]*)$`)
-	importer.movieWithoutYearRegex = mapregexp.MustCompile(`(?P<name>.+?)\.(?P<ext>[^\.]*)$`)
+	importer.movieWithYearRegex = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)*(?P<year>(19|[2-9]\d)\d{2})(\.|-|_|\s)*(?P<other>.*?)\s*\.(?P<ext>[^\.]*)$`)
+	importer.movieWithoutYearRegex = mapregexp.MustCompile(`(?P<name>.+?)\s*\.(?P<ext>[^\.]*)$`)
 
 	importer.tvdbWebSearchSeriesRegex = regexp.MustCompile(`(?P<before><a href="/\?tab=series&amp;id=)(?P<seriesId>\d+)(?P<after>\&amp;lid=\d*">)`)
 
@@ -198,6 +204,8 @@ func (importer *NasImporter) detectTVShowFields(path string) (tvShowFields map[s
 	tvRegexes := [...]*mapregexp.MapRegexp{
 		importer.tvShowRegex1,
 		importer.tvShowRegex2,
+		importer.tvShowRegex3,
+		importer.tvShowRegex4,
 	}
 
 	// Try the different tvRegexes.
@@ -260,6 +268,8 @@ func (importer *NasImporter) detectDocumentaryFields(path string) (documentaryFi
 	documentaryRegexes := [...]*mapregexp.MapRegexp{
 		importer.tvShowRegex1,
 		importer.tvShowRegex2,
+		importer.tvShowRegex3,
+		importer.tvShowRegex4,
 		importer.yearDocumentaryRegex,
 		importer.multiDocumentaryRegex,
 		importer.singleDocumentaryRegex,
@@ -313,7 +323,16 @@ func (importer *NasImporter) detectIMDBMovie(name string) (movieIMDBResults []im
 
 	// Search IMDB for results.
 	// Ignore error, it seems that if no results are found we get an error.
-	movieIMDBResults, _ = imdb.SearchTitle(&importer.imdbClient, probableTitle)
+	rawMovieIMDBResults, _ := imdb.SearchTitle(&importer.imdbClient, probableTitle)
+	idMap := make(map[string]struct{})
+
+	for _, rawMovieIMDBResult := range rawMovieIMDBResults {
+		if _, ok := idMap[rawMovieIMDBResult.ID]; !ok {
+			idMap[rawMovieIMDBResult.ID] = struct{}{}
+
+			movieIMDBResults = append(movieIMDBResults, rawMovieIMDBResult)
+		}
+	}
 
 	return
 }
@@ -406,7 +425,7 @@ func (importer *NasImporter) importMKV(path, outPath string) (err error) {
 }
 
 func (importer *NasImporter) importTV(path string, fileFields map[string]string, data interface{}) (err error) {
-	seasonNum, err := strconv.ParseUint(fileFields["series"], 10, 64)
+	seasonNum, err := strconv.ParseUint(fileFields["season"], 10, 64)
 
 	if err != nil {
 		return
@@ -428,7 +447,9 @@ func (importer *NasImporter) importTV(path string, fileFields map[string]string,
 			seriesName = castData.SeriesName
 
 			if castData.Seasons == nil {
-				castData.GetDetail()
+				if err = castData.GetDetail(); err != nil {
+					return
+				}
 			}
 
 			season, ok := castData.Seasons[seasonNum]
@@ -449,11 +470,32 @@ func (importer *NasImporter) importTV(path string, fileFields map[string]string,
 
 			if episodeName == "" {
 				err = errors.New(fmt.Sprintf("Episode %v doesn't exist on TheTVDB.", episodeNum))
+
+				return
+			}
+
+			// Replace ASCII slash with unicode division slash in file name parts.
+			seriesName = strings.Replace(seriesName, "/", "∕", -1)
+			episodeName = strings.Replace(episodeName, "/", "∕", -1)
+
+			if runtime.GOOS == "windows" {
+				m := regexp.MustCompile(`[\\\?\%\*\:\|\"\<\>\=\,\;\[\]]`)
+
+				seriesName = m.ReplaceAllString(seriesName, "")
+				episodeName = m.ReplaceAllString(episodeName, "")
 			}
 
 			outPath = fmt.Sprintf("%s/%s/Season %02d/%s S%02dE%02d - %s.mkv", importer.config.MediaDirs.TVDir, seriesName, seasonNum, seriesName, seasonNum, episodeNum, episodeName)
 		case string:
-			seriesName = data.(string)
+			// Replace ASCII slash with unicode division slash in file name parts.
+			seriesName = strings.Replace(data.(string), "/", "∕", -1)
+
+			if runtime.GOOS == "windows" {
+				m := regexp.MustCompile(`[\\\?\%\*\:\|\"\<\>\=\,\;\[\]]`)
+
+				seriesName = m.ReplaceAllString(seriesName, "")
+			}
+
 			outPath = fmt.Sprintf("%s/%s/Season %02d/%s S%02dE%02d.mkv", importer.config.MediaDirs.TVDir, seriesName, seasonNum, seriesName, seasonNum, episodeNum)
 	}
 
@@ -467,6 +509,10 @@ func (importer *NasImporter) importDocumentary(path string, fileFields map[strin
 }
 
 func (importer *NasImporter) importMovie(path string, fileFields map[string]string, data interface{}) (err error) {
+	movie := data.(imdb.Title)
+	outPath := fmt.Sprintf("%v/%v (%v).mkv", importer.config.MediaDirs.MovieDir, movie.Name, movie.Year)
+	err = importer.importMKV(path, outPath)
+
 	return
 }
 
@@ -505,7 +551,7 @@ func (importer *NasImporter) Import(path string) (err error) {
 			log.Fatal(err)
 		}
 
-		tvShowTVDBResults, err = importer.detectTvdbSeries(tvShowFields["name"], "!documentary")
+		tvShowTVDBResults, err = importer.detectTvdbSeries(tvShowFields["name"], "")
 
 		if err != nil {
 			log.Fatal(err)
@@ -588,7 +634,14 @@ func (importer *NasImporter) Import(path string) (err error) {
 	fmt.Printf("\nMost likely TV show matches (TheTVDB):\n")
 
 	for index, tvShowTVDBResult := range tvShowTVDBResults.Series {
-		score := importer.getLevenshteinDistance(tvShowFields["name"], tvShowTVDBResult.SeriesName)
+		score := 0
+
+		if year, ok := tvShowFields["year"]; ok {
+			score = importer.getLevenshteinDistance(fmt.Sprintf(tvShowFields["name"] + " (%v)", year), fmt.Sprintf(tvShowTVDBResult.SeriesName))
+		} else {
+			score = importer.getLevenshteinDistance(tvShowFields["name"], tvShowTVDBResult.SeriesName)
+		}
+
 		scoreItem := ScoreItem{value: tvShowTVDBResult.SeriesName, score: score, source: TVTVDB, data: tvShowTVDBResult}
 		absoluteOrder = append(absoluteOrder, scoreItem)
 
@@ -636,7 +689,14 @@ func (importer *NasImporter) Import(path string) (err error) {
 	fmt.Printf("\nMost likely movie matches (IMDb):\n")
 
 	for index, movieIMDBResult := range movieIMDBResults {
-		score := importer.getLevenshteinDistance(movieFields["name"], movieIMDBResult.Name)
+		score := 0
+
+		if year, ok := movieFields["year"]; ok {
+			score = importer.getLevenshteinDistance(fmt.Sprintf(movieFields["name"] + " (%v)", year), fmt.Sprintf(movieIMDBResult.Name + " (%v)", movieIMDBResult.Year))
+		} else {
+			score = importer.getLevenshteinDistance(movieFields["name"], movieIMDBResult.Name)
+		}
+
 		scoreItem := ScoreItem{value: movieIMDBResult.Name, score: score, source: MovieIMDB, data: movieIMDBResult}
 		absoluteOrder = append(absoluteOrder, scoreItem)
 
@@ -674,9 +734,9 @@ func (importer *NasImporter) Import(path string) (err error) {
 			if result.source == MovieIMDB {
 				movie := result.data.(imdb.Title)
 
-				fmt.Printf("\t%v | %v (%v)\n\t\t%v\n", index + 1, result.value, movie.Year, source)
+				fmt.Printf("%v \t%v | %v (%v)\n\t\t%v\n", result.score, index + 1, result.value, movie.Year, source)
 			} else {
-				fmt.Printf("\t%v | %v\n\t\t%v\n", index + 1, result.value, source)
+				fmt.Printf("%v \t%v | %v\n\t\t%v\n", result.score, index + 1, result.value, source)
 			}
 		} else {
 			break
