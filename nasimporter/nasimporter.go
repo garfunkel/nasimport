@@ -17,7 +17,6 @@ import (
 	"strconv"
 	"os/exec"
 	"bytes"
-	"runtime"
 	"github.com/garfunkel/go-mapregexp"
 	"github.com/garfunkel/go-tvdb"
 	"github.com/StalkR/imdb"
@@ -38,8 +37,8 @@ const (
 	Unknown MediaSource = iota
 	TVTVDB
 	DocumentaryTVDB
+	DocumentaryIMDB
 	MovieIMDB
-	MovieLocal
 	TVLocal
 	DocumentaryLocal
 )
@@ -59,6 +58,8 @@ type Config struct {
 	} `json:"interface"`
 }
 
+type CacheKey [2]string
+
 type NasImporter struct {
 	tvShowRegex1 *mapregexp.MapRegexp
 	tvShowRegex2 *mapregexp.MapRegexp
@@ -72,14 +73,14 @@ type NasImporter struct {
 	existingTVShowDirs []string
 	existingDocumentaryFiles []string
 	existingDocumentaryDirs []string
-	existingMovieFiles []string
-	existingMovieDirs []string
 	tvdbWebSearchSeriesRegex *regexp.Regexp
 	wordRegex *regexp.Regexp
 	imdbClient http.Client
 	automaticMode bool
 	configPath string
 	config Config
+	tvdbCache map[CacheKey]tvdb.SeriesList
+	imdbCache map[CacheKey][]imdb.Title
 }
 
 type ScoreItem struct {
@@ -125,7 +126,9 @@ func NewNasImporter(configPath string, automaticMode bool) (importer NasImporter
 
 	importer.ReadConfig()
 
-	// /home/simon/dataFRED/Usenet/Downloads/never/Never.Mind.The.Buzzcocks.UK.S27E05.720p.HDTV.x264-thebeeb.nzb/never.mind.the.buzzcocks.uk.2705.720p.hdtv.x264-thebeeb.mkv
+	importer.tvdbCache = map[CacheKey]tvdb.SeriesList{}
+	importer.imdbCache = map[CacheKey][]imdb.Title{}
+
 	importer.tvShowRegex1 = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)+([\(\[]?(?P<year>\d{4})[\)\]]?).*?(\.|-|_|\s)+[sS](?P<season>\d+).*?[eE](?P<episode>\d+)(\.|-|_|\s)*(?P<other>.*?)\s*\.(?P<ext>[^\.]*)$`)
 	importer.tvShowRegex2 = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)*[sS](?P<season>\d+).*?[eE](?P<episode>\d+)(\.|-|_|\s)*(?P<other>.*?)\s*\.(?P<ext>[^\.]*)$`)
 	importer.tvShowRegex3 = mapregexp.MustCompile(`(?P<name>.+?)(\.|-|_|\s)+([\(\[]?(?P<year>\d{4})[\)\]]?).*?(\.|-|_|\s)+(?P<season>\d+)[xX]?(?P<episode>\d{2})(\.|-|_|\s)*(?P<other>.*?)\s*\.(?P<ext>[^\.]*)$`)
@@ -163,7 +166,6 @@ func (importer *NasImporter) ReadConfig() (err error) {
 func (importer *NasImporter) ReadExistingMedia() (err error) {
 	_, importer.existingTVShowDirs, err = importer.getFilesDirs(importer.config.MediaDirs.TVDir)
 	importer.existingDocumentaryFiles, importer.existingDocumentaryDirs, err = importer.getFilesDirs(importer.config.MediaDirs.DocumentaryDir)
-	importer.existingMovieFiles, importer.existingMovieDirs, err = importer.getFilesDirs(importer.config.MediaDirs.MovieDir)
 
 	return
 }
@@ -235,9 +237,51 @@ func (importer *NasImporter) detectTVShow(name string) (order ScoreItems, err er
 func (importer *NasImporter) detectTvdbSeries(name, genre string) (seriesList tvdb.SeriesList, err error) {
 	words := importer.wordRegex.FindAllString(name, -1)
 	probableTitle := strings.Join(words, " ")
+	cacheKey := CacheKey{probableTitle, genre}
+	seriesList, ok := importer.tvdbCache[cacheKey]
+
+	if ok {
+		return
+	}
 
 	// Search TVDB for results.
 	seriesList, err = tvdb.SearchSeries(probableTitle, importer.config.Interface.NumVisibleResults)
+	rawMovieIMDBResults, _ := imdb.SearchTitle(&importer.imdbClient, probableTitle)
+	idMap := make(map[string]struct{})
+	count := 0
+
+	for _, rawMovieIMDBResult := range rawMovieIMDBResults {
+		if rawMovieIMDBResult.Type == "TV Series" || rawMovieIMDBResult.Type == "TV Mini-Series" {
+			if _, ok := idMap[rawMovieIMDBResult.ID]; ok {
+				continue
+			}
+
+			idMap[rawMovieIMDBResult.ID] = struct{}{}
+			series, err := tvdb.GetSeriesByIMDBId(rawMovieIMDBResult.ID)
+
+			if err == nil {
+				found := false
+
+				for _, existingSeries := range seriesList.Series {
+					if existingSeries.Id == series.Id {
+						found = true
+
+						break
+					}
+				}
+
+				if found {
+					continue
+				}
+
+				seriesList.Series = append(seriesList.Series, series)
+
+				if count++; count >= 10 {
+					break
+				}
+			}
+		}
+	}
 
 	if genre != "" {
 		genreSeriesList := tvdb.SeriesList{}
@@ -260,6 +304,8 @@ func (importer *NasImporter) detectTvdbSeries(name, genre string) (seriesList tv
 
 		seriesList = genreSeriesList
 	}
+
+	importer.tvdbCache[cacheKey] = seriesList
 
 	return
 }
@@ -311,28 +357,69 @@ func (importer *NasImporter) detectMovieFields(path string) (movieFields map[str
 	return
 }
 
-func (importer *NasImporter) detectMovie(name string) (order ScoreItems, err error) {
-	order = importer.getLevenshteinOrder(importer.existingMovieDirs, name)
-
-	return
-}
-
-func (importer *NasImporter) detectIMDBMovie(name string) (movieIMDBResults []imdb.Title, err error) {
+func (importer *NasImporter) detectIMDBMovie(name, genre string) (movieIMDBResults []imdb.Title, err error) {
 	movieWords := importer.wordRegex.FindAllString(name, -1)
 	probableTitle := strings.Join(movieWords, " ")
+	cacheKey := CacheKey{probableTitle, genre}
+	movieIMDBResults, ok := importer.imdbCache[cacheKey]
+
+	if ok {
+		return
+	}
 
 	// Search IMDB for results.
 	// Ignore error, it seems that if no results are found we get an error.
 	rawMovieIMDBResults, _ := imdb.SearchTitle(&importer.imdbClient, probableTitle)
 	idMap := make(map[string]struct{})
+	count := 0
 
 	for _, rawMovieIMDBResult := range rawMovieIMDBResults {
+		if !(rawMovieIMDBResult.Type == "" || rawMovieIMDBResult.Type == "Video" || rawMovieIMDBResult.Type == "TV Movie") {
+			continue
+		}
+
 		if _, ok := idMap[rawMovieIMDBResult.ID]; !ok {
 			idMap[rawMovieIMDBResult.ID] = struct{}{}
 
 			movieIMDBResults = append(movieIMDBResults, rawMovieIMDBResult)
+
+			if count++; count >= 10 {
+				break
+			}
 		}
 	}
+
+	if genre != "" {
+		genreMovieIMDBResults := []imdb.Title{}
+		negate := false
+
+		if genre[0] == '!' {
+			negate = true
+			genre = genre[1 :]
+		}
+
+		for _, movieIMDBResult := range movieIMDBResults {
+			fullMovieIMDBResult, err := imdb.NewTitle(&importer.imdbClient, movieIMDBResult.ID)
+
+			if err != nil {
+				continue
+			}
+
+			movieIMDBResult = *fullMovieIMDBResult
+
+			for _, movieGenre := range movieIMDBResult.Genres {
+				if (strings.ToLower(genre) == strings.ToLower(movieGenre)) != negate {
+					genreMovieIMDBResults = append(genreMovieIMDBResults, movieIMDBResult)
+
+					break
+				}
+			}
+		}
+
+		movieIMDBResults = genreMovieIMDBResults
+	}
+
+	importer.imdbCache[cacheKey] = movieIMDBResults
 
 	return
 }
@@ -405,6 +492,16 @@ func (importer *NasImporter) importMKV(path, outPath string) (err error) {
 		return
 	}
 
+	if strings.HasSuffix(strings.ToLower(path), ".mkv") {
+		err = os.Rename(path, outPath)
+
+		if err != nil {
+			fmt.Println(err)
+		}
+
+		return
+	}
+
 	err = importer.importMKVUsingMKVMerge(path, outPath)
 
 	if err == nil {
@@ -424,7 +521,41 @@ func (importer *NasImporter) importMKV(path, outPath string) (err error) {
 	return
 }
 
+func (importer *NasImporter) GetTVDBEpisodeName(series *tvdb.Series, seasonNum, episodeNum uint64) (episodeName string, err error) {
+	if series.Seasons == nil {
+		if err = series.GetDetail(); err != nil {
+			return
+		}
+	}
+
+	season, ok := series.Seasons[seasonNum]
+
+	if !ok {
+		err = errors.New(fmt.Sprintf("Season %v doesn't exist on TheTVDB.", seasonNum))
+
+		return
+	} else {
+		for _, episode := range season {
+			if episode.EpisodeNumber == episodeNum {
+				episodeName = episode.EpisodeName
+
+				break
+			}
+		}
+	}
+
+	if episodeName == "" {
+		err = errors.New(fmt.Sprintf("Episode %v doesn't exist on TheTVDB.", episodeNum))
+
+		return
+	}
+
+	return
+}
+
 func (importer *NasImporter) importTV(path string, fileFields map[string]string, data interface{}) (err error) {
+	seriesName := ""
+	episodeName := ""
 	seasonNum, err := strconv.ParseUint(fileFields["season"], 10, 64)
 
 	if err != nil {
@@ -437,67 +568,29 @@ func (importer *NasImporter) importTV(path string, fileFields map[string]string,
 		return
 	}
 
-	seriesName := ""
-	episodeName := ""
-	outPath := ""
-
 	switch data.(type) {
 		case tvdb.Series:
-			castData := data.(tvdb.Series)
-			seriesName = castData.SeriesName
+			series := data.(tvdb.Series)
+			seriesName = series.SeriesName
+			episodeName, err = importer.GetTVDBEpisodeName(&series, seasonNum, episodeNum)
 
-			if castData.Seasons == nil {
-				if err = castData.GetDetail(); err != nil {
-					return
-				}
-			}
-
-			season, ok := castData.Seasons[seasonNum]
-
-			if !ok {
-				err = errors.New(fmt.Sprintf("Season %v doesn't exist on TheTVDB.", seasonNum))
-
-				return
-			} else {
-				for _, episode := range season {
-					if episode.EpisodeNumber == episodeNum {
-						episodeName = episode.EpisodeName
-
-						break
-					}
-				}
-			}
-
-			if episodeName == "" {
-				err = errors.New(fmt.Sprintf("Episode %v doesn't exist on TheTVDB.", episodeNum))
-
+			if err != nil {
 				return
 			}
 
-			// Replace ASCII slash with unicode division slash in file name parts.
-			seriesName = strings.Replace(seriesName, "/", "∕", -1)
-			episodeName = strings.Replace(episodeName, "/", "∕", -1)
-
-			if runtime.GOOS == "windows" {
-				m := regexp.MustCompile(`[\\\?\%\*\:\|\"\<\>\=\,\;\[\]]`)
-
-				seriesName = m.ReplaceAllString(seriesName, "")
-				episodeName = m.ReplaceAllString(episodeName, "")
-			}
-
-			outPath = fmt.Sprintf("%s/%s/Season %02d/%s S%02dE%02d - %s.mkv", importer.config.MediaDirs.TVDir, seriesName, seasonNum, seriesName, seasonNum, episodeNum, episodeName)
 		case string:
-			// Replace ASCII slash with unicode division slash in file name parts.
-			seriesName = strings.Replace(data.(string), "/", "∕", -1)
-
-			if runtime.GOOS == "windows" {
-				m := regexp.MustCompile(`[\\\?\%\*\:\|\"\<\>\=\,\;\[\]]`)
-
-				seriesName = m.ReplaceAllString(seriesName, "")
-			}
-
-			outPath = fmt.Sprintf("%s/%s/Season %02d/%s S%02dE%02d.mkv", importer.config.MediaDirs.TVDir, seriesName, seasonNum, seriesName, seasonNum, episodeNum)
+			seriesName = data.(string)
 	}
+
+	// Replace ASCII slash with unicode division slash in file name parts.
+	seriesName = strings.Replace(seriesName, "/", "∕", -1)
+	episodeName = strings.Replace(episodeName, "/", "∕", -1)
+
+	if episodeName != "" {
+		episodeName = " - " + episodeName
+	}
+
+	outPath := fmt.Sprintf("%s/%s/Season %02d/%s S%02dE%02d%s.mkv", importer.config.MediaDirs.TVDir, seriesName, seasonNum, seriesName, seasonNum, episodeNum, episodeName)
 
 	err = importer.importMKV(path, outPath)
 
@@ -505,12 +598,93 @@ func (importer *NasImporter) importTV(path string, fileFields map[string]string,
 }
 
 func (importer *NasImporter) importDocumentary(path string, fileFields map[string]string, data interface{}) (err error) {
+	outPath := ""
+	seriesName := ""
+	episodeName := ""
+	hasSeasonAndEpisode := true
+	hasYear := true
+
+	// This documentary may or may not have season/episode numbers.
+	seasonNum, err := strconv.ParseUint(fileFields["season"], 10, 64)
+
+	if err != nil {
+		seasonNum = 1
+	}
+
+	episodeNum, err := strconv.ParseUint(fileFields["episode"], 10, 64)
+
+	if err != nil {
+		hasSeasonAndEpisode = false
+	}
+
+	year, err := strconv.ParseUint(fileFields["year"], 10, 64)
+
+	if err != nil {
+		hasYear = false
+	}
+
+	switch data.(type) {
+		case tvdb.Series:
+			series := data.(tvdb.Series)
+			seriesName = series.SeriesName
+
+			if !hasSeasonAndEpisode {
+				err = errors.New("Documentary found on TheTVDB, but no detected season/episode number.")
+	
+				return
+			}
+
+			episodeName, err = importer.GetTVDBEpisodeName(&series, seasonNum, episodeNum)
+
+			if err != nil {
+				return
+			}
+
+			seriesName = strings.Replace(seriesName, "/", "∕", -1)
+			episodeName = strings.Replace(episodeName, "/", "∕", -1)
+
+			if episodeName != "" {
+				episodeName = " - " + episodeName
+			}
+
+			outPath = fmt.Sprintf("%s/%s/Season %02d/%s S%02dE%02d%s.mkv", importer.config.MediaDirs.DocumentaryDir, seriesName, seasonNum, seriesName, seasonNum, episodeNum, episodeName)
+
+		case imdb.Title:
+			title := data.(imdb.Title)
+
+			// FIXME: IMDb titles may have seasons/episodes - not supported by current IMDb lib.
+			outPath = fmt.Sprintf("%v/%v (%v).mkv", importer.config.MediaDirs.DocumentaryDir, title.Name, title.Year)
+
+		case string:
+			seriesName := data.(string)
+
+			if hasSeasonAndEpisode {
+				seriesName = strings.Replace(seriesName, "/", "∕", -1)
+				outPath = fmt.Sprintf("%s/%s/Season %02d/%s S%02dE%02d.mkv", importer.config.MediaDirs.DocumentaryDir, seriesName, seasonNum, seriesName, seasonNum, episodeNum)
+			} else if hasYear {
+				outPath = fmt.Sprintf("%v/%v (%v).mkv", importer.config.MediaDirs.DocumentaryDir, seriesName, year)
+			} else {
+				outPath = fmt.Sprintf("%v/%v.mkv", importer.config.MediaDirs.DocumentaryDir, seriesName)
+			}
+	}
+
+	fmt.Println(outPath)
+	//err = importer.importMKV(path, outPath)
+
 	return
 }
 
 func (importer *NasImporter) importMovie(path string, fileFields map[string]string, data interface{}) (err error) {
-	movie := data.(imdb.Title)
+	movie, ok := data.(imdb.Title)
+
+	if !ok {
+		err = errors.New("Unable to import movie, invalid data type.")
+
+		return
+	}
+
 	outPath := fmt.Sprintf("%v/%v (%v).mkv", importer.config.MediaDirs.MovieDir, movie.Name, movie.Year)
+
 	err = importer.importMKV(path, outPath)
 
 	return
@@ -545,6 +719,8 @@ func (importer *NasImporter) Import(path string) (err error) {
 	tvShowTVDBResults := tvdb.SeriesList{}
 
 	if err == nil {
+		fmt.Printf("TV show fields: %v\n", tvShowFields)
+
 		tvShowOrder, err = importer.detectTVShow(tvShowFields["name"])
 
 		if err != nil {
@@ -565,15 +741,35 @@ func (importer *NasImporter) Import(path string) (err error) {
 	documentaryFields, err := importer.detectDocumentaryFields(file)
 	documentaryOrder := ScoreItems{}
 	documentaryTVDBResults := tvdb.SeriesList{}
+	documentaryIMDBResults := []imdb.Title{}
 
 	if err == nil {
+		fmt.Printf("Documentary fields: %v\n", documentaryFields)
+
 		documentaryOrder, err = importer.detectDocumentary(documentaryFields["name"])
 
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		documentaryTVDBResults, err = importer.detectTvdbSeries(documentaryFields["name"], "documentary")
+		hasSeasonAndEpisode := true
+
+		// This documentary may or may not have season/episode numbers.
+		_, err := strconv.ParseUint(documentaryFields["episode"], 10, 64)
+
+		if err != nil {
+			hasSeasonAndEpisode = false
+		}
+
+		if hasSeasonAndEpisode {
+			documentaryTVDBResults, err = importer.detectTvdbSeries(documentaryFields["name"], "documentary")
+
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+
+		documentaryIMDBResults, err = importer.detectIMDBMovie(documentaryFields["name"], "documentary")
 
 		if err != nil {
 			log.Fatal(err)
@@ -585,15 +781,10 @@ func (importer *NasImporter) Import(path string) (err error) {
 	fmt.Printf("Attempting to detect if this is a movie...\n")
 
 	movieFields, err := importer.detectMovieFields(file)
-	movieOrder := ScoreItems{}
 	movieIMDBResults := []imdb.Title{}
 
 	if err == nil {
-		movieOrder, err = importer.detectMovie(movieFields["name"])
-
-		if err != nil {
-			log.Fatal(err)
-		}
+		fmt.Printf("Movie fields: %v\n", movieFields)
 
 		movieName := movieFields["name"]
 
@@ -604,7 +795,7 @@ func (importer *NasImporter) Import(path string) (err error) {
 			movieName += " (" + movieYear + ")"
 		}
 
-		movieIMDBResults, err = importer.detectIMDBMovie(movieName)
+		movieIMDBResults, err = importer.detectIMDBMovie(movieName, "")
 
 		if err != nil {
 			log.Fatal(err)
@@ -613,12 +804,8 @@ func (importer *NasImporter) Import(path string) (err error) {
 		fmt.Println(err)
 	}
 
-	// Logic to decide best type of media.
-	fmt.Printf("TV FIELDS: %#v\nDOC FIELDS: %#v\nMOVIE FIELDS: %#v\n", tvShowFields, documentaryFields, movieFields)
-
 	fmt.Printf("Most likely TV show matches (local):\n")
 
-	//choices := make(map[int]ImportChoice)
 	absoluteOrder := ScoreItems{}
 
 	for index, tvShow := range tvShowOrder {
@@ -674,16 +861,23 @@ func (importer *NasImporter) Import(path string) (err error) {
 		}
 	}
 
-	fmt.Printf("\nMost likely movie matches (local):\n")
+	fmt.Printf("\nMost likely documentary matches (IMDb):\n")
 
-	for index, movie := range movieOrder {
-		if index < importer.config.Interface.NumVisibleResults {
-			fmt.Printf("\t%v\n", movie.value)
+	for index, documentaryIMDBResult := range documentaryIMDBResults {
+		score := 0
+
+		if year, ok := documentaryFields["year"]; ok {
+			score = importer.getLevenshteinDistance(fmt.Sprintf(documentaryFields["name"] + " (%v)", year), fmt.Sprintf(documentaryIMDBResult.Name + " (%v)", documentaryIMDBResult.Year))
+		} else {
+			score = importer.getLevenshteinDistance(documentaryFields["name"], documentaryIMDBResult.Name)
 		}
 
-		movie.source = MovieLocal
-		movie.data = movie.value
-		absoluteOrder = append(absoluteOrder, movie)
+		scoreItem := ScoreItem{value: documentaryIMDBResult.Name, score: score, source: DocumentaryIMDB, data: documentaryIMDBResult}
+		absoluteOrder = append(absoluteOrder, scoreItem)
+
+		if index < importer.config.Interface.NumVisibleResults {
+			fmt.Printf("\t%v (%v)\n", documentaryIMDBResult.Name, documentaryIMDBResult.Year)
+		}
 	}
 
 	fmt.Printf("\nMost likely movie matches (IMDb):\n")
@@ -718,14 +912,15 @@ func (importer *NasImporter) Import(path string) (err error) {
 					source = "local TV show"
 				case DocumentaryLocal:
 					source = "local documentary"
-				case MovieLocal:
-					source = "local movie"
 				case TVTVDB:
 					series := result.data.(tvdb.Series)
 					source = fmt.Sprintf("TheTVDB TV show (ID: %v)", series.Id)
 				case DocumentaryTVDB:
 					series := result.data.(tvdb.Series)
 					source = fmt.Sprintf("TheTVDB documentary (ID: %v)", series.Id)
+				case DocumentaryIMDB:
+					movie := result.data.(imdb.Title)
+					source = fmt.Sprintf("IMDb documentary (ID: %s)", movie.ID)
 				case MovieIMDB:
 					movie := result.data.(imdb.Title)
 					source = fmt.Sprintf("IMDb movie (ID: %v)", movie.ID)
@@ -776,8 +971,8 @@ func (importer *NasImporter) Import(path string) (err error) {
 		case DocumentaryTVDB:
 			err = importer.importDocumentary(path, documentaryFields, match.data)
 
-		case MovieLocal:
-			err = importer.importMovie(path, movieFields, match.data)
+		case DocumentaryIMDB:
+			err = importer.importDocumentary(path, documentaryFields, match.data)
 
 		case MovieIMDB:
 			err = importer.importMovie(path, movieFields, match.data)
